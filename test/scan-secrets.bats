@@ -43,3 +43,35 @@ setup() {
   [ "$status" -eq 1 ]
   echo "$output" | grep -qF "$SAMPLE"
 }
+
+# --- Hardening regression tests (Phase 1 code review, CR-1..CR-4) ---
+
+@test "CR-1: a nonexistent target file fails (does not report clean)" {
+  run "$SCAN" "$BATS_TEST_TMPDIR/does-not-exist.zsh"
+  [ "$status" -ne 0 ]
+}
+
+@test "CR-2: a literal secret after a \${VAR} prefix is flagged (exclusion is end-anchored)" {
+  printf 'export API_KEY=${PREFIX}-actual-literal-secret-data\n' > "$BATS_TEST_TMPDIR/c2.zsh"
+  run "$SCAN" "$BATS_TEST_TMPDIR/c2.zsh"
+  [ "$status" -eq 1 ]
+}
+
+@test "CR-3: lowercase secret-shaped variable names are flagged (case-insensitive)" {
+  printf 'export api_key=realsecretvalue123\nexport DB_password=hunter2\n' > "$BATS_TEST_TMPDIR/c3.zsh"
+  run "$SCAN" "$BATS_TEST_TMPDIR/c3.zsh"
+  [ "$status" -eq 1 ]
+}
+
+@test "CR-4: a whole-RHS runtime reference with quotes still passes (no over-flag)" {
+  printf 'export SOME_TOKEN="${OTHER_VAR}"\nexport OTHER_TOKEN=$(echo hi)\n' > "$BATS_TEST_TMPDIR/c4ok.zsh"
+  run "$SCAN" "$BATS_TEST_TMPDIR/c4ok.zsh"
+  [ "$status" -eq 0 ]
+}
+
+@test "CR-4: Layer 1 does not print the raw secret value on a named-secret hit" {
+  printf 'export PGPASSWORD=SUPERSECRETVALUE42\n' > "$BATS_TEST_TMPDIR/c4leak.zsh"
+  run "$SCAN" "$BATS_TEST_TMPDIR/c4leak.zsh"
+  [ "$status" -eq 1 ]
+  ! echo "$output" | grep -q 'SUPERSECRETVALUE42'
+}
