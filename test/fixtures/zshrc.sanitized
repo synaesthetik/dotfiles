@@ -1,0 +1,7 @@
+# fake fixture -- no real secrets; five named secrets extracted to ~/.zshrc.local
+export AWS_VAULT_BACKEND=file
+[ -f ~/.zshrc.local ] && source ~/.zshrc.local
+export AWS_SESSION_TOKEN_TTL=12h
+
+export CODEARTIFACT_TOKEN=$(aws codeartifact get-authorization-token --query authorizationToken --output text)
+export POETRY_HTTP_BASIC_CODEARTIFACT_PASSWORD="${CODEARTIFACT_TOKEN}"

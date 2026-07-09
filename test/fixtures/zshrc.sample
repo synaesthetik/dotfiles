@@ -1,0 +1,12 @@
+# fake fixture -- no real secrets, only fake literal placeholders
+export AWS_VAULT_BACKEND=file
+export AWS_VAULT_FILE_PASSPHRASE=fake-passphrase-0001
+export AWS_SESSION_TOKEN_TTL=12h
+
+export PGPASSWORD=fake-pg-password
+export SEND_SAFELY_KEY_ID=fake-sendsafely-id
+export SEND_SAFELY_KEY_SECRET=fake-sendsafely-secret
+export CIRCLE_TOKEN=fake-circle-token
+
+export CODEARTIFACT_TOKEN=$(aws codeartifact get-authorization-token --query authorizationToken --output text)
+export POETRY_HTTP_BASIC_CODEARTIFACT_PASSWORD="${CODEARTIFACT_TOKEN}"
