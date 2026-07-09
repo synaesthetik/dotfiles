@@ -4,3 +4,6 @@
 # symlinked into $HOME (Stow's built-in defaults are discarded once a
 # .stow-local-ignore exists — see 01-RESEARCH.md Pitfall 3).
 \.DS_Store
+# *.example stubs (e.g. zshrc.local.example) are in-repo reconstruction
+# references, not $HOME config — never symlink them out.
+.*\.example
