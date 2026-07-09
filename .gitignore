@@ -1,0 +1,9 @@
+# Defensive keep-out: the real ~/.zshrc.local lives at $HOME and is
+# structurally outside this repo's tree, but guard against a *.local
+# file mistakenly created inside the repo itself.
+*.local
+.zshrc.local
+*.bak
+
+# Example/reconstruction stubs are documentation, not secrets — keep tracked.
+!*.local.example

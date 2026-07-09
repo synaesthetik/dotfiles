@@ -1,0 +1,17 @@
+# Reconstruction guide for ~/.zshrc.local
+#
+# This file is a documented stub. The REAL ~/.zshrc.local lives at $HOME,
+# is gitignored, and is never committed — it never enters this repo in
+# any form. To rebuild it on a new machine, copy this file to ~/.zshrc.local
+# and fill in real values:
+#
+#   cp zsh/zshrc.local.example ~/.zshrc.local
+#
+# zsh/.zshrc sources it via a guarded line near the top:
+#   [ -f ~/.zshrc.local ] && source ~/.zshrc.local
+
+# export AWS_VAULT_FILE_PASSPHRASE=CHANGEME
+# export PGPASSWORD=CHANGEME
+# export SEND_SAFELY_KEY_ID=CHANGEME
+# export SEND_SAFELY_KEY_SECRET=CHANGEME
+# export CIRCLE_TOKEN=CHANGEME
