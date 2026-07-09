@@ -75,3 +75,9 @@ setup() {
   [ "$status" -eq 1 ]
   ! echo "$output" | grep -q 'SUPERSECRETVALUE42'
 }
+
+@test "CR-2: a multi-line command substitution opener (=\$( at EOL) is not flagged" {
+  printf 'export API_TOKEN=$(\n  echo hi \\\n  )\n' > "$BATS_TEST_TMPDIR/c2ml.zsh"
+  run "$SCAN" "$BATS_TEST_TMPDIR/c2ml.zsh"
+  [ "$status" -eq 0 ]
+}
