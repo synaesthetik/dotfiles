@@ -22,4 +22,6 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 stow --no-folding -t "$HOME" -d "$REPO_DIR" zsh git
+
+mkdir -p "$HOME/.claude"
 stow --no-folding -t "$HOME/.claude" -d "$REPO_DIR" claude
