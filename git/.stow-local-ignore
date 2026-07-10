@@ -1,0 +1,6 @@
+# This file REPLACES Stow's built-in default ignore list for this package
+# (it does not merge with it). If this package ever gains a README/LICENSE/
+# COPYING file, those must be listed here explicitly too, or they will be
+# symlinked into $HOME (Stow's built-in defaults are discarded once a
+# .stow-local-ignore exists — see 01-RESEARCH.md Pitfall 3).
+\.DS_Store
