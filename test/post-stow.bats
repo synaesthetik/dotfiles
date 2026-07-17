@@ -52,6 +52,12 @@ skip_if_claude_not_migrated() {
   fi
 }
 
+skip_if_no_dot() {
+  if [ ! -e "$REPO_DIR/bin/dot" ]; then
+    skip "bin/dot does not exist yet (Plan 03-02 GREEN) -- skipping dot CLI assertions"
+  fi
+}
+
 @test "HOME/.zshrc, .zprofile, .p10k.zsh resolve into the repo's zsh/ package" {
   skip_if_not_migrated
 
@@ -163,4 +169,89 @@ skip_if_claude_not_migrated() {
   skip_if_claude_not_migrated
 
   ! git -C "$REPO_DIR" ls-files -s claude/skills/ | grep -q '^160000'
+}
+
+# --- Phase 3 (Plan 03-02): dot CLI, stow idempotency, arch-awareness ---
+
+@test "bin/dot is executable" {
+  skip_if_no_dot
+
+  [ -x "$REPO_DIR/bin/dot" ]
+}
+
+@test "dot help exits 0 and lists all five subcommands" {
+  skip_if_no_dot
+
+  run "$REPO_DIR/bin/dot" help
+  [ "$status" -eq 0 ]
+  for cmd in install stow update doctor uninstall; do
+    echo "$output" | grep -qw "$cmd" || { echo "expected 'dot help' output to list '$cmd'" >&2; return 1; }
+  done
+}
+
+@test "dot update, dot doctor, dot uninstall each exit non-zero with a v2-stub message" {
+  skip_if_no_dot
+
+  for cmd in update doctor uninstall; do
+    run "$REPO_DIR/bin/dot" "$cmd"
+    [ "$status" -ne 0 ]
+    echo "$output" | grep -qF "not yet implemented (v2)" || { echo "expected 'dot $cmd' to print 'not yet implemented (v2)', got: $output" >&2; return 1; }
+  done
+}
+
+@test "dot bogus (unknown subcommand) exits non-zero" {
+  skip_if_no_dot
+
+  run "$REPO_DIR/bin/dot" bogus
+  [ "$status" -ne 0 ]
+}
+
+@test "dot stow zsh is idempotent across two consecutive runs and still resolves into repo/zsh" {
+  skip_if_no_dot
+  skip_if_not_migrated
+
+  run "$REPO_DIR/bin/dot" stow zsh
+  [ "$status" -eq 0 ]
+  run "$REPO_DIR/bin/dot" stow zsh
+  [ "$status" -eq 0 ]
+
+  [ -L "$HOME/.zshrc" ]
+  case "$(readlink -f "$HOME/.zshrc")" in
+    "$REPO_DIR"/zsh/*) : ;;
+    *) echo "expected $HOME/.zshrc to resolve inside $REPO_DIR/zsh, got $(readlink -f "$HOME/.zshrc")" >&2; return 1 ;;
+  esac
+}
+
+@test "dot stow (no arg) keeps ~/.claude a real directory with CLAUDE.md symlinked into repo/claude" {
+  skip_if_no_dot
+  skip_if_claude_not_migrated
+
+  run "$REPO_DIR/bin/dot" stow
+  [ "$status" -eq 0 ]
+
+  [ -d "$HOME/.claude" ]
+  [ ! -L "$HOME/.claude" ]
+  [ -L "$HOME/.claude/CLAUDE.md" ]
+  case "$(readlink -f "$HOME/.claude/CLAUDE.md")" in
+    "$REPO_DIR"/claude/*) : ;;
+    *) echo "expected $HOME/.claude/CLAUDE.md to resolve inside $REPO_DIR/claude" >&2; return 1 ;;
+  esac
+}
+
+@test "dot install with brew hidden from PATH dies with the missing-brew guard (does not run brew bundle)" {
+  skip_if_no_dot
+
+  run env PATH="/usr/bin:/bin" "$REPO_DIR/bin/dot" install
+  [ "$status" -eq 1 ]
+  echo "$output" | grep -qF "run ./bootstrap.sh first" || { echo "expected missing-brew guard message, got: $output" >&2; return 1; }
+}
+
+@test "zsh/.zprofile resolves the brew prefix arch-aware (both existence-check branches present)" {
+  grep -qF '[[ -x /opt/homebrew/bin/brew ]]' "$REPO_DIR/zsh/.zprofile"
+  grep -qF '[[ -x /usr/local/bin/brew ]]' "$REPO_DIR/zsh/.zprofile"
+}
+
+@test "no new hardcoded homebrew prefix leaks outside .zprofile's arch branches / pre-existing baselines" {
+  run bash -c "grep -rn '/opt/homebrew\|/usr/local' '$REPO_DIR/zsh' '$REPO_DIR/git' '$REPO_DIR/claude' | grep -v '/\.zprofile:' | grep -v '/\.zshrc:' | grep -v '/settings\.json:'"
+  [ "$status" -ne 0 ]
 }
