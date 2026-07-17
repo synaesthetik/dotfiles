@@ -26,9 +26,10 @@ brew "yj"
 brew "yq"
 
 # --- Runtimes / language tooling ---
-# NOTE for review: asdf/nodenv/pyenv overlap as version managers; MISE-01
-# (mise migration) is deferred to v2 per STATE.md Deferred Items, so these
-# stay as today's actual runtime managers until that migration lands.
+# asdf/nodenv/pyenv/rbenv-vars overlap as version managers. `mise` (MISE-01)
+# is the recommended consolidation per CLAUDE.md's Technology Stack table,
+# but that migration is deferred to v2 (STATE.md Deferred Items) -- these
+# stay as today's active runtime managers until that migration lands.
 brew "asdf"
 brew "bash"
 brew "go"
@@ -47,18 +48,18 @@ brew "docker-credential-helper-ecr"
 brew "stern"         # Kubernetes log tailer
 
 # --- Dev / build tools ---
-brew "cmake"         # NOTE for review: native-module builds -- confirm still needed
+brew "cmake"         # native-module builds
 brew "duckdb"
 brew "imagemagick"
 brew "libpq@16"
 brew "mkcert"        # local TLS certs for dev
 brew "poppler"       # PDF tooling
-brew "unrtf"         # NOTE for review: RTF conversion -- niche, confirm still needed
+brew "unrtf"         # RTF conversion, occasional use
 
 # --- Networking / diagnostics ---
-# NOTE for review: arp-scan/mtr/nmap are investigative/one-off-shaped tools --
-# confirm which (if any) are worth keeping on every fresh Mac vs. installing
-# ad hoc when actually needed.
+# arp-scan/mtr/nmap are investigative/one-off-shaped tools in daily practice,
+# but kept here for parity with today's actual toolset (approved as-is,
+# Task 2 review -- no functionality removed).
 brew "arp-scan"
 brew "mtr"
 brew "nmap"
