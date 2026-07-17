@@ -7,6 +7,7 @@ export PATH="$HOME/.local/bin:$PATH"
 export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
 export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
 export PATH="/opt/homebrew/opt/libpq/bin:$PATH"
+export PATH="${${${(%):-%x}:A}:h:h}/bin:$PATH"
 export LIBPQ_INCLUDE_DIR=$(brew --prefix libpq)/include
 export LIBPQ_LIB_DIR=$(brew --prefix libpq)/lib
 export INFRA_HOME=/Users/patrick.lewis/code/infrastructure
