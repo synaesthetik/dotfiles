@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# dot -- dependency-free management CLI for this dotfiles repo. Kept
+# /bin/bash-3.2-safe (plain `case` dispatch, indexed args only -- no
+# bash-4+-only constructs) so it never depends on a Homebrew-installed
+# bash -- see 03-RESEARCH.md Pattern 3 for the full incompatible-construct
+# list.
+#
+# The two-target stow logic in dot_stow (zsh/git -> $HOME; claude ->
+# $HOME/.claude with a mkdir -p guard) is moved verbatim from bootstrap.sh,
+# not re-derived: a single `-t "$HOME"` call for all three packages was
+# proven broken (stray ~/CLAUDE.md, ~/settings.json, ~/skills) -- see
+# 02-03-SUMMARY.md.
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+dot_stow() {
+  local pkg="${1:-}"
+
+  case "$pkg" in
+    zsh)
+      stow --no-folding -t "$HOME" -d "$REPO_DIR" zsh
+      ;;
+    git)
+      stow --no-folding -t "$HOME" -d "$REPO_DIR" git
+      ;;
+    claude)
+      mkdir -p "$HOME/.claude"
+      stow --no-folding -t "$HOME/.claude" -d "$REPO_DIR" claude
+      ;;
+    "")
+      stow --no-folding -t "$HOME" -d "$REPO_DIR" zsh git
+      mkdir -p "$HOME/.claude"
+      stow --no-folding -t "$HOME/.claude" -d "$REPO_DIR" claude
+      ;;
+    *)
+      echo "dot: unknown package '$pkg' (expected zsh, git, or claude)" >&2
+      exit 1
+      ;;
+  esac
+}
+
+dot_install() {
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
+    exit 1
+  fi
+
+  brew bundle --file="$REPO_DIR/Brewfile"
+  dot_stow
+}
+
+dot_help() {
+  cat <<'EOF'
+dot -- dotfiles management CLI
+
+Usage: dot <command>
+
+Commands:
+  install     brew bundle + stow every package (run after ./bootstrap.sh)
+  stow [pkg]  stow a single package (zsh, git, claude) or all if omitted
+  update      not yet implemented (v2)
+  doctor      not yet implemented (v2)
+  uninstall   not yet implemented (v2)
+  help        show this message
+EOF
+}
+
+case "${1:-help}" in
+  install) shift; dot_install "$@" ;;
+  stow)    shift; dot_stow "$@" ;;
+  update|doctor|uninstall)
+    echo "dot $1: not yet implemented (v2)" >&2
+    exit 1
+    ;;
+  help|--help|-h) dot_help ;;
+  *)
+    echo "dot: unknown subcommand '${1:-}'" >&2
+    dot_help
+    exit 1
+    ;;
+esac

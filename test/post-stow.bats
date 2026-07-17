@@ -243,7 +243,7 @@ skip_if_no_dot() {
 
   run env PATH="/usr/bin:/bin" "$REPO_DIR/bin/dot" install
   [ "$status" -eq 1 ]
-  echo "$output" | grep -qF "run ./bootstrap.sh first" || { echo "expected missing-brew guard message, got: $output" >&2; return 1; }
+  echo "$output" | grep -qF "Run ./bootstrap.sh first" || { echo "expected missing-brew guard message, got: $output" >&2; return 1; }
 }
 
 @test "zsh/.zprofile resolves the brew prefix arch-aware (both existence-check branches present)" {
