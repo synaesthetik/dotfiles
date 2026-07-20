@@ -207,12 +207,68 @@ skip_if_brewfile_dirty() {
   done
 }
 
-@test "dot uninstall exits non-zero with a v2-stub message" {
+@test "dot uninstall zsh --yes removes the zsh symlinks and exits 0" {
   skip_if_no_dot
+  skip_if_not_migrated
 
-  run "$REPO_DIR/bin/dot" uninstall
-  [ "$status" -ne 0 ]
-  echo "$output" | grep -qF "not yet implemented (v2)" || { echo "expected 'dot uninstall' to print 'not yet implemented (v2)', got: $output" >&2; return 1; }
+  run "$REPO_DIR/bin/dot" uninstall zsh --yes
+  [ "$status" -eq 0 ]
+  [ ! -L "$HOME/.zshrc" ]
+
+  "$REPO_DIR/bin/dot" stow zsh
+}
+
+@test "dot uninstall zsh --yes run again on an already-unstowed package is a clean no-op" {
+  skip_if_no_dot
+  skip_if_not_migrated
+
+  run "$REPO_DIR/bin/dot" uninstall zsh --yes
+  [ "$status" -eq 0 ]
+  run "$REPO_DIR/bin/dot" uninstall zsh --yes
+  [ "$status" -eq 0 ]
+
+  "$REPO_DIR/bin/dot" stow zsh
+}
+
+@test "dot uninstall claude --yes is non-destructive: ~/.claude stays a real dir with runtime state and repo files intact" {
+  skip_if_no_dot
+  skip_if_claude_not_migrated
+
+  run "$REPO_DIR/bin/dot" uninstall claude --yes
+  [ "$status" -eq 0 ]
+
+  [ -d "$HOME/.claude" ]
+  [ ! -L "$HOME/.claude" ]
+  for d in projects sessions shell-snapshots; do
+    [ -d "$HOME/.claude/$d" ]
+    [ ! -L "$HOME/.claude/$d" ]
+  done
+  [ -f "$REPO_DIR/claude/CLAUDE.md" ]
+
+  "$REPO_DIR/bin/dot" stow claude
+}
+
+@test "dot uninstall zsh with non-TTY stdin bypasses the confirmation prompt and exits 0" {
+  skip_if_no_dot
+  skip_if_not_migrated
+
+  run bash -c "printf '' | \"$REPO_DIR/bin/dot\" uninstall zsh"
+  [ "$status" -eq 0 ]
+
+  "$REPO_DIR/bin/dot" stow zsh
+}
+
+@test "dot uninstall --yes with no package argument unstows all packages" {
+  skip_if_no_dot
+  skip_if_not_migrated
+  skip_if_claude_not_migrated
+
+  run "$REPO_DIR/bin/dot" uninstall --yes
+  [ "$status" -eq 0 ]
+  [ ! -L "$HOME/.zshrc" ]
+  [ ! -L "$HOME/.claude/CLAUDE.md" ]
+
+  "$REPO_DIR/bin/dot" stow
 }
 
 @test "dot update is idempotent across two consecutive runs on a clean tree" {
