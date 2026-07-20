@@ -207,14 +207,41 @@ skip_if_brewfile_dirty() {
   done
 }
 
-@test "dot update, dot uninstall each exit non-zero with a v2-stub message" {
+@test "dot uninstall exits non-zero with a v2-stub message" {
   skip_if_no_dot
 
-  for cmd in update uninstall; do
-    run "$REPO_DIR/bin/dot" "$cmd"
-    [ "$status" -ne 0 ]
-    echo "$output" | grep -qF "not yet implemented (v2)" || { echo "expected 'dot $cmd' to print 'not yet implemented (v2)', got: $output" >&2; return 1; }
-  done
+  run "$REPO_DIR/bin/dot" uninstall
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -qF "not yet implemented (v2)" || { echo "expected 'dot uninstall' to print 'not yet implemented (v2)', got: $output" >&2; return 1; }
+}
+
+@test "dot update is idempotent across two consecutive runs on a clean tree" {
+  skip_if_no_dot
+
+  if [ -n "$(git -C "$REPO_DIR" status --porcelain)" ]; then
+    skip "working tree is not clean at test entry -- dot update's own dirty-tree guard would refuse; skipping idempotency assertion"
+  fi
+
+  if ! git -C "$REPO_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    skip "no git upstream/tracking branch configured on this machine -- 'git pull' cannot succeed here, unrelated to dot update's implementation"
+  fi
+
+  run "$REPO_DIR/bin/dot" update
+  [ "$status" -eq 0 ]
+  run "$REPO_DIR/bin/dot" update
+  [ "$status" -eq 0 ]
+}
+
+@test "dot update on a dirty working tree exits 1 with a commit-or-stash message and never pulls" {
+  skip_if_no_dot
+
+  echo '# dot-update-test' >> "$REPO_DIR/Brewfile"
+
+  run "$REPO_DIR/bin/dot" update
+  git -C "$REPO_DIR" checkout -- Brewfile
+
+  [ "$status" -eq 1 ]
+  echo "$output" | grep -qiE "commit or stash" || { echo "expected a commit-or-stash message, got: $output" >&2; return 1; }
 }
 
 @test "dot doctor on a healthy post-stow machine exits 0" {
