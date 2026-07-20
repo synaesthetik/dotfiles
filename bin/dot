@@ -51,6 +51,26 @@ dot_install() {
   dot_stow
 }
 
+dot_update() {
+  if [ -n "$(git -C "$REPO_DIR" status --porcelain)" ]; then
+    echo "dot: working tree has uncommitted changes -- commit or stash your changes first, then re-run" >&2
+    exit 1
+  fi
+
+  git -C "$REPO_DIR" pull
+
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
+    exit 1
+  fi
+
+  brew bundle --file="$REPO_DIR/Brewfile"
+
+  stow -R --no-folding -t "$HOME" -d "$REPO_DIR" zsh git
+  mkdir -p "$HOME/.claude"
+  stow -R --no-folding -t "$HOME/.claude" -d "$REPO_DIR" claude
+}
+
 dot_doctor() {
   local fix=0
   while [ $# -gt 0 ]; do
@@ -141,7 +161,7 @@ Usage: dot <command>
 Commands:
   install     brew bundle + stow every package (run after ./bootstrap.sh)
   stow [pkg]  stow a single package (zsh, git, claude) or all if omitted
-  update      not yet implemented (v2)
+  update      git pull + brew bundle + restow (fails fast on dirty tree)
   doctor      report stow/Brewfile health (--fix re-stows broken symlinks)
   uninstall   not yet implemented (v2)
   help        show this message
@@ -151,7 +171,8 @@ EOF
 case "${1:-help}" in
   install) shift; dot_install "$@" ;;
   stow)    shift; dot_stow "$@" ;;
-  update|uninstall)
+  update)  shift; dot_update "$@" ;;
+  uninstall)
     echo "dot $1: not yet implemented (v2)" >&2
     exit 1
     ;;
