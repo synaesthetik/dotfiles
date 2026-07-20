@@ -189,14 +189,76 @@ skip_if_no_dot() {
   done
 }
 
-@test "dot update, dot doctor, dot uninstall each exit non-zero with a v2-stub message" {
+@test "dot update, dot uninstall each exit non-zero with a v2-stub message" {
   skip_if_no_dot
 
-  for cmd in update doctor uninstall; do
+  for cmd in update uninstall; do
     run "$REPO_DIR/bin/dot" "$cmd"
     [ "$status" -ne 0 ]
     echo "$output" | grep -qF "not yet implemented (v2)" || { echo "expected 'dot $cmd' to print 'not yet implemented (v2)', got: $output" >&2; return 1; }
   done
+}
+
+@test "dot doctor on a healthy post-stow machine exits 0" {
+  skip_if_no_dot
+  skip_if_not_migrated
+
+  run "$REPO_DIR/bin/dot" doctor
+  [ "$status" -eq 0 ]
+}
+
+@test "dot doctor detects a broken managed symlink and names it" {
+  skip_if_no_dot
+  skip_if_not_migrated
+
+  rm -f "$HOME/.zprofile"
+  run "$REPO_DIR/bin/dot" doctor
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -qF ".zprofile" || { echo "expected 'dot doctor' output to mention .zprofile, got: $output" >&2; "$REPO_DIR/bin/dot" stow zsh; return 1; }
+
+  "$REPO_DIR/bin/dot" stow zsh
+}
+
+@test "dot doctor --fix restores a broken managed symlink back into the repo" {
+  skip_if_no_dot
+  skip_if_not_migrated
+
+  rm -f "$HOME/.zprofile"
+  run "$REPO_DIR/bin/dot" doctor --fix
+  [ "$status" -eq 0 ]
+
+  [ -L "$HOME/.zprofile" ]
+  case "$(readlink -f "$HOME/.zprofile")" in
+    "$REPO_DIR"/zsh/*) : ;;
+    *) echo "expected $HOME/.zprofile to resolve inside $REPO_DIR/zsh after --fix, got $(readlink -f "$HOME/.zprofile")" >&2; return 1 ;;
+  esac
+}
+
+@test "dot doctor --fix does not clobber a real (non-symlink) file at a stowed path" {
+  skip_if_no_dot
+  skip_if_not_migrated
+
+  rm -f "$HOME/.zprofile"
+  echo "not a symlink" > "$HOME/.zprofile"
+
+  run "$REPO_DIR/bin/dot" doctor --fix
+  [ ! -L "$HOME/.zprofile" ]
+  grep -qF "not a symlink" "$HOME/.zprofile"
+
+  rm -f "$HOME/.zprofile"
+  "$REPO_DIR/bin/dot" stow zsh
+}
+
+@test "dot doctor reports a missing Brewfile-declared binary with a dot update hint" {
+  skip_if_no_dot
+
+  echo 'brew "dot-doctor-nonexistent-formula"' >> "$REPO_DIR/Brewfile"
+
+  run "$REPO_DIR/bin/dot" doctor
+  [ "$status" -ne 0 ]
+  echo "$output" | grep -qF "dot update" || { echo "expected 'dot doctor' output to hint at 'dot update', got: $output" >&2; git -C "$REPO_DIR" checkout -- Brewfile; return 1; }
+
+  git -C "$REPO_DIR" checkout -- Brewfile
 }
 
 @test "dot bogus (unknown subcommand) exits non-zero" {
