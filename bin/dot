@@ -152,6 +152,47 @@ dot_doctor() {
   echo "dot doctor: all checks passed"
 }
 
+dot_uninstall() {
+  local assume_yes=0
+  local pkg=""
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --yes|-y) assume_yes=1; shift ;;
+      -*) echo "dot: unknown flag '$1'" >&2; exit 1 ;;
+      *) pkg="$1"; shift ;;
+    esac
+  done
+
+  if [ -t 0 ] && [ "$assume_yes" -ne 1 ]; then
+    read -r -p "Remove ${pkg:-all} symlinks from \$HOME? [y/N] " reply
+    case "$reply" in
+      y|Y|yes|YES) : ;;
+      *) echo "dot: aborted" >&2; exit 1 ;;
+    esac
+  fi
+
+  case "$pkg" in
+    zsh)
+      stow -D --no-folding -t "$HOME" -d "$REPO_DIR" zsh
+      ;;
+    git)
+      stow -D --no-folding -t "$HOME" -d "$REPO_DIR" git
+      ;;
+    claude)
+      stow -D --no-folding -t "$HOME/.claude" -d "$REPO_DIR" claude
+      ;;
+    "")
+      stow -D --no-folding -t "$HOME" -d "$REPO_DIR" zsh git
+      stow -D --no-folding -t "$HOME/.claude" -d "$REPO_DIR" claude
+      ;;
+    *)
+      echo "dot: unknown package '$pkg' (expected zsh, git, or claude)" >&2
+      exit 1
+      ;;
+  esac
+}
+
 dot_help() {
   cat <<'EOF'
 dot -- dotfiles management CLI
@@ -163,7 +204,7 @@ Commands:
   stow [pkg]  stow a single package (zsh, git, claude) or all if omitted
   update      git pull + brew bundle + restow (fails fast on dirty tree)
   doctor      report stow/Brewfile health (--fix re-stows broken symlinks)
-  uninstall   not yet implemented (v2)
+  uninstall   stow -D a package's symlinks (all if omitted; prompts unless --yes)
   help        show this message
 EOF
 }
@@ -172,10 +213,7 @@ case "${1:-help}" in
   install) shift; dot_install "$@" ;;
   stow)    shift; dot_stow "$@" ;;
   update)  shift; dot_update "$@" ;;
-  uninstall)
-    echo "dot $1: not yet implemented (v2)" >&2
-    exit 1
-    ;;
+  uninstall) shift; dot_uninstall "$@" ;;
   doctor) shift; dot_doctor "$@" ;;
   help|--help|-h) dot_help ;;
   *)
