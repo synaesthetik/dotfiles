@@ -7,12 +7,24 @@
 # with a clear message instead of erroring, since the assertions below are
 # about POST-migration state.
 
+setup_file() {
+  local repo_dir
+  repo_dir="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
+
+  if command -v brew >/dev/null 2>&1 && brew bundle check --file="$repo_dir/Brewfile" >/dev/null 2>&1; then
+    echo 1 > "$BATS_FILE_TMPDIR/brew_healthy"
+  else
+    echo 0 > "$BATS_FILE_TMPDIR/brew_healthy"
+  fi
+}
+
 setup() {
   REPO_DIR="$(cd "$(dirname "$BATS_TEST_FILENAME")/.." && pwd)"
   ZSHRC_LINK_TARGET=""
   MIGRATED=0
   GIT_MIGRATED=0
   CLAUDE_MIGRATED=0
+  BREW_HEALTHY="$(cat "$BATS_FILE_TMPDIR/brew_healthy" 2>/dev/null || echo 0)"
 
   if [ -L "$HOME/.zshrc" ]; then
     ZSHRC_LINK_TARGET="$(readlink -f "$HOME/.zshrc")"
@@ -55,6 +67,12 @@ skip_if_claude_not_migrated() {
 skip_if_no_dot() {
   if [ ! -e "$REPO_DIR/bin/dot" ]; then
     skip "bin/dot does not exist yet (Plan 03-02 GREEN) -- skipping dot CLI assertions"
+  fi
+}
+
+skip_if_brewfile_dirty() {
+  if [ "$BREW_HEALTHY" -ne 1 ]; then
+    skip "Brewfile is not currently satisfied on this machine (pre-existing package drift, unrelated to dot doctor's implementation) -- skipping assertion that assumes a healthy Brewfile baseline"
   fi
 }
 
@@ -202,6 +220,7 @@ skip_if_no_dot() {
 @test "dot doctor on a healthy post-stow machine exits 0" {
   skip_if_no_dot
   skip_if_not_migrated
+  skip_if_brewfile_dirty
 
   run "$REPO_DIR/bin/dot" doctor
   [ "$status" -eq 0 ]
@@ -222,6 +241,7 @@ skip_if_no_dot() {
 @test "dot doctor --fix restores a broken managed symlink back into the repo" {
   skip_if_no_dot
   skip_if_not_migrated
+  skip_if_brewfile_dirty
 
   rm -f "$HOME/.zprofile"
   run "$REPO_DIR/bin/dot" doctor --fix

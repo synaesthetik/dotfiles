@@ -51,6 +51,87 @@ dot_install() {
   dot_stow
 }
 
+dot_doctor() {
+  local fix=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --fix) fix=1; shift ;;
+      -*) echo "dot: unknown flag '$1'" >&2; exit 1 ;;
+      *) shift ;;
+    esac
+  done
+
+  local unresolved=0
+  local entry pkg target file rel dest link_target
+  local -a broken_pkgs=()
+
+  for entry in "zsh:$HOME" "git:$HOME" "claude:$HOME/.claude"; do
+    pkg="${entry%%:*}"
+    target="${entry#*:}"
+
+    while IFS= read -r file; do
+      rel="${file#"$REPO_DIR"/"$pkg"/}"
+      case "$rel" in
+        .stow-local-ignore|*.example) continue ;;
+      esac
+
+      dest="$target/$rel"
+
+      if [ -L "$dest" ]; then
+        link_target="$(readlink -f "$dest")"
+        case "$link_target" in
+          "$REPO_DIR"/"$pkg"/*) : ;;
+          *)
+            echo "dot doctor: $dest resolves outside $REPO_DIR/$pkg (broken symlink)" >&2
+            unresolved=$((unresolved + 1))
+            broken_pkgs+=("$pkg")
+            ;;
+        esac
+      elif [ -e "$dest" ]; then
+        echo "dot doctor: $dest exists but is a real file, not a symlink -- not touching it (run 'dot stow $pkg' manually if intended)" >&2
+        unresolved=$((unresolved + 1))
+      else
+        echo "dot doctor: $dest is missing (expected a symlink into $REPO_DIR/$pkg)" >&2
+        unresolved=$((unresolved + 1))
+        broken_pkgs+=("$pkg")
+      fi
+    done < <(find "$REPO_DIR/$pkg" -type f)
+  done
+
+  if [ "$fix" -eq 1 ] && [ "${#broken_pkgs[@]}" -gt 0 ]; then
+    local seen=" " p
+    for p in "${broken_pkgs[@]}"; do
+      case "$seen" in
+        *" $p "*) continue ;;
+      esac
+      seen="$seen$p "
+      dot_stow "$p"
+    done
+    unresolved=$((unresolved - ${#broken_pkgs[@]}))
+  fi
+
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
+    exit 1
+  fi
+
+  local brew_output
+  if brew_output="$(brew bundle check --verbose --file="$REPO_DIR/Brewfile" 2>&1)"; then
+    :
+  else
+    echo "$brew_output" >&2
+    echo "dot doctor: missing Brewfile-declared packages -- run 'dot update' to install missing packages" >&2
+    unresolved=$((unresolved + 1))
+  fi
+
+  if [ "$unresolved" -gt 0 ]; then
+    echo "dot doctor: $unresolved issue(s) found" >&2
+    exit 1
+  fi
+
+  echo "dot doctor: all checks passed"
+}
+
 dot_help() {
   cat <<'EOF'
 dot -- dotfiles management CLI
@@ -61,7 +142,7 @@ Commands:
   install     brew bundle + stow every package (run after ./bootstrap.sh)
   stow [pkg]  stow a single package (zsh, git, claude) or all if omitted
   update      not yet implemented (v2)
-  doctor      not yet implemented (v2)
+  doctor      report stow/Brewfile health (--fix re-stows broken symlinks)
   uninstall   not yet implemented (v2)
   help        show this message
 EOF
@@ -70,10 +151,11 @@ EOF
 case "${1:-help}" in
   install) shift; dot_install "$@" ;;
   stow)    shift; dot_stow "$@" ;;
-  update|doctor|uninstall)
+  update|uninstall)
     echo "dot $1: not yet implemented (v2)" >&2
     exit 1
     ;;
+  doctor) shift; dot_doctor "$@" ;;
   help|--help|-h) dot_help ;;
   *)
     echo "dot: unknown subcommand '${1:-}'" >&2
