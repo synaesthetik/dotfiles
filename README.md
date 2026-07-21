@@ -70,6 +70,18 @@ dot help        show this message
   dirty working tree (`commit or stash first`). Once clean, it runs `git
   pull` → `brew bundle` → `stow -R` in one call, idempotent to re-run.
 
+## macOS system defaults
+
+`./macos.sh` applies Patrick's curated macOS `defaults write` deltas. It's an
+**explicit opt-in** — you run it yourself with `./macos.sh`; it's never
+invoked by `./bootstrap.sh` or any `dot` command. It's idempotent (safe to
+re-run) and covers four user-domain areas: Dock, Finder, keyboard & trackpad,
+and screenshots & misc. It only writes to the user domain — no `sudo`, no
+`/Library` writes — and runs fully unattended with no password prompt. Some
+changes only take effect after logout or after relaunching the affected app;
+`macos.sh` doesn't force-restart Dock/Finder, it just prints a note to that
+effect when it's done.
+
 ## Secrets — the `.local` keep-out
 
 This is a public repo, so no secret value is ever committed. Machine-specific
