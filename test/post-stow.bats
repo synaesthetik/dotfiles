@@ -438,28 +438,27 @@ skip_if_brewfile_dirty() {
 @test "macos.sh is idempotent: two consecutive runs exit 0 and leave defaults state byte-identical" {
   skip_if_no_macos_script
 
-  local before after1 after2
-  before="$BATS_TEST_TMPDIR/before.txt"
+  local after1 after2
   after1="$BATS_TEST_TMPDIR/after1.txt"
   after2="$BATS_TEST_TMPDIR/after2.txt"
 
-  for domain in com.apple.dock com.apple.finder NSGlobalDomain com.apple.screencapture; do
-    defaults read "$domain" >> "$before"
-  done
-
+  # Idempotency is run-N vs run-N+1, NOT run-1 vs pristine: on a fresh Mac the
+  # first run legitimately adds the codified keys, so a pre-run baseline would
+  # fail here. Capture only the domains macos.sh actually writes -- excluding
+  # com.apple.screencapture, which the script never touches and whose volatile
+  # last-analytics-stamp macOS mutates on its own (a flaky diff source).
   run "$REPO_DIR/macos.sh"
   [ "$status" -eq 0 ]
-  for domain in com.apple.dock com.apple.finder NSGlobalDomain com.apple.screencapture; do
+  for domain in com.apple.dock com.apple.finder NSGlobalDomain; do
     defaults read "$domain" >> "$after1"
   done
 
   run "$REPO_DIR/macos.sh"
   [ "$status" -eq 0 ]
-  for domain in com.apple.dock com.apple.finder NSGlobalDomain com.apple.screencapture; do
+  for domain in com.apple.dock com.apple.finder NSGlobalDomain; do
     defaults read "$domain" >> "$after2"
   done
 
-  diff "$before" "$after1"
   diff "$after1" "$after2"
 }
 
