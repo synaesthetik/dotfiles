@@ -49,16 +49,26 @@ Once `bin/` is on your `PATH` (the `zsh` package adds it), a dependency-free
 ```
 dot install     brew bundle + stow every package (run after ./bootstrap.sh)
 dot stow [pkg]  stow a single package (zsh, git, claude) or all if omitted
-dot help        show usage
+dot update      git pull + brew bundle + restow (fails fast on dirty tree)
+dot doctor      report stow/Brewfile health (--fix re-stows broken symlinks)
+dot uninstall   stow -D a package's symlinks (all if omitted; prompts unless --yes)
+dot help        show this message
 ```
 
-`dot update`, `dot doctor`, and `dot uninstall` exist as **v2 stubs** — they
-print `not yet implemented (v2)` and exit non-zero. They are placeholders in
-the command surface, not working features, for:
-
-- `dot update` (`SYNC-01`) — `git pull` + `brew bundle` + re-stow in one call
-- `dot doctor` (`HEALTH-01`) — symlink/brew/secret health checks
-- `dot uninstall` (`STOW-01`) — unstow wrapper (`stow -D`)
+- `dot doctor` is **report-only** by default — it checks that stowed symlinks
+  resolve into the repo and that every Brewfile-declared package is present,
+  and never modifies anything unless you pass `--fix`. Even with `--fix`, it
+  only re-stows *broken or missing* symlinks; a real file sitting where a
+  symlink is expected is left untouched (it's reported instead, so nothing is
+  ever clobbered).
+- `dot uninstall [pkg]` prompts `y/N` before removing anything, unless you
+  pass `--yes`/`-y` or you're running non-interactively (non-TTY). It only
+  tears down stow-owned symlinks (`stow -D`) for the given package, or all
+  packages if omitted — real files and `~/.claude`'s runtime state (Claude
+  Code's own transcripts, todo state) are never touched.
+- `dot update` aborts fast — before touching anything — if the repo has a
+  dirty working tree (`commit or stash first`). Once clean, it runs `git
+  pull` → `brew bundle` → `stow -R` in one call, idempotent to re-run.
 
 ## Secrets — the `.local` keep-out
 
