@@ -75,8 +75,9 @@ dot help        show this message
 `./macos.sh` applies Patrick's curated macOS `defaults write` deltas. It's an
 **explicit opt-in** — you run it yourself with `./macos.sh`; it's never
 invoked by `./bootstrap.sh` or any `dot` command. It's idempotent (safe to
-re-run) and covers four user-domain areas: Dock, Finder, keyboard & trackpad,
-and screenshots & misc. It only writes to the user domain — no `sudo`, no
+re-run) and currently sets defaults across three user-domain areas — Dock,
+Finder, and keyboard & trackpad — with a fourth slot (screenshots & misc) kept
+as an empty placeholder to extend later. It only writes to the user domain — no `sudo`, no
 `/Library` writes — and runs fully unattended with no password prompt. Some
 changes only take effect after logout or after relaunching the affected app;
 `macos.sh` doesn't force-restart Dock/Finder, it just prints a note to that
