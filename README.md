@@ -103,14 +103,9 @@ cp zsh/zshrc.local.example ~/.zshrc.local
 in the repo), while `*.local.example` stays tracked (it's a documentation
 stub, not a secret).
 
-## v2 roadmap
+## Deferred to a later milestone
 
-Deferred to a future milestone, reserved as stubs/comments today rather than
-built:
-
-- `SYNC-01` — `dot update`
-- `HEALTH-01` — `dot doctor`
-- `STOW-01` — `dot uninstall`
-- `MACOS-01` — `macos.sh` system defaults
-- `MISE-01` — consolidate asdf/nodenv/pyenv onto `mise`
-- `CI-01` — GitHub Actions lint for the bootstrap scripts
+- `MISE-01` — consolidate asdf/nodenv/pyenv onto `mise` for unified runtime
+  version management
+- `CI-01` — add GitHub Actions lint (shellcheck/shfmt) for the bootstrap
+  scripts
