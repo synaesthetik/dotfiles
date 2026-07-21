@@ -70,6 +70,12 @@ skip_if_no_dot() {
   fi
 }
 
+skip_if_no_macos_script() {
+  if [ ! -e "$REPO_DIR/macos.sh" ]; then
+    skip "macos.sh does not exist yet -- skipping macOS defaults idempotency assertions"
+  fi
+}
+
 skip_if_brewfile_dirty() {
   if [ "$BREW_HEALTHY" -ne 1 ]; then
     skip "Brewfile is not currently satisfied on this machine (pre-existing package drift, unrelated to dot doctor's implementation) -- skipping assertion that assumes a healthy Brewfile baseline"
@@ -418,5 +424,48 @@ skip_if_brewfile_dirty() {
 
 @test "no new hardcoded homebrew prefix leaks outside .zprofile's arch branches / pre-existing baselines" {
   run bash -c "grep -rn '/opt/homebrew\|/usr/local' '$REPO_DIR/zsh' '$REPO_DIR/git' '$REPO_DIR/claude' | grep -v '/\.zprofile:' | grep -v '/\.zshrc:' | grep -v '/settings\.json:'"
+  [ "$status" -ne 0 ]
+}
+
+# --- Phase 5 (Plan 05-01): macos.sh idempotency, executable, non-wiring ---
+
+@test "macos.sh is executable" {
+  skip_if_no_macos_script
+
+  [ -x "$REPO_DIR/macos.sh" ]
+}
+
+@test "macos.sh is idempotent: two consecutive runs exit 0 and leave defaults state byte-identical" {
+  skip_if_no_macos_script
+
+  local before after1 after2
+  before="$BATS_TEST_TMPDIR/before.txt"
+  after1="$BATS_TEST_TMPDIR/after1.txt"
+  after2="$BATS_TEST_TMPDIR/after2.txt"
+
+  for domain in com.apple.dock com.apple.finder NSGlobalDomain com.apple.screencapture; do
+    defaults read "$domain" >> "$before"
+  done
+
+  run "$REPO_DIR/macos.sh"
+  [ "$status" -eq 0 ]
+  for domain in com.apple.dock com.apple.finder NSGlobalDomain com.apple.screencapture; do
+    defaults read "$domain" >> "$after1"
+  done
+
+  run "$REPO_DIR/macos.sh"
+  [ "$status" -eq 0 ]
+  for domain in com.apple.dock com.apple.finder NSGlobalDomain com.apple.screencapture; do
+    defaults read "$domain" >> "$after2"
+  done
+
+  diff "$before" "$after1"
+  diff "$after1" "$after2"
+}
+
+@test "macos.sh is never invoked from bootstrap.sh or bin/dot" {
+  skip_if_no_macos_script
+
+  run bash -c "grep -n 'macos.sh' '$REPO_DIR/bootstrap.sh' '$REPO_DIR/bin/dot'"
   [ "$status" -ne 0 ]
 }
