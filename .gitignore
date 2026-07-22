@@ -7,3 +7,6 @@
 
 # Example/reconstruction stubs are documentation, not secrets — keep tracked.
 !*.local.example
+
+# Internal GSD planning docs — kept on disk, never published
+.planning/
