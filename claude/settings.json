@@ -121,7 +121,8 @@
   "enabledPlugins": {
     "frontend-design@claude-plugins-official": true
   },
+  "tui": "fullscreen",
   "skipDangerousModePermissionPrompt": true,
   "skipAutoPermissionPrompt": true,
-  "tui": "fullscreen"
+  "skipWorkflowUsageWarning": true
 }
