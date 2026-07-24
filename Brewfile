@@ -20,6 +20,7 @@ brew "gnu-sed"
 brew "jq"
 brew "ripgrep"
 brew "shellcheck"    # lints this repo's own bash scripts
+brew "shfmt"         # formats/checks this repo's own bash scripts (dot lint, CI parity)
 brew "watch"
 brew "wget"
 brew "yj"
