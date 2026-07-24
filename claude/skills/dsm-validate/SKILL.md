@@ -1,13 +1,20 @@
 ---
 name: dsm-validate
-description: Bulk-validate DatastoreMigration (kubedb Redis -> ot) CRDs before confirming cleanup. Read-only; classifies each migration GREEN/YELLOW/RED and prints the confirm command for the safe ones. Trigger on "validate migrations", "check the dsms", "are these migrations safe to complete", "verify datastore migrations".
+description: Bulk-validate DatastoreMigration CRDs (kubedb Redis -> opstree, and kubedb Postgres -> CNPG) before confirming cleanup. Read-only; classifies each migration GREEN/YELLOW/RED and prints the confirm command for the safe ones. Trigger on "validate migrations", "check the dsms", "are these migrations safe to complete", "verify datastore migrations".
 ---
 
 # dsm-validate
 
 Validate a batch of `DatastoreMigration` CRDs before you annotate them for cleanup. Confirming a migration is **destructive** — it deletes the source PVC — so this checks each one is genuinely healthy first, then hands you the confirm command only for the ones that pass.
 
-Read-only by default — it never annotates, restarts, or deletes a migration or its data. The optional `--source-check` mode is the one exception: it creates and deletes a short-lived pod that mounts the source PVC `readOnly` (see below).
+**Two migration shapes, auto-detected per DSM** (discriminator: `spec.targetProvider=="cnpg"` or a `status.postgres` block → postgres; else redis):
+
+- **redis** (`kubedb -> opstree`): rsync + AOF/RDB boot-log logic. This is the original path — everything below about rsync, `DBSIZE`, the boot log, and the 0-keys trap applies to it.
+- **postgres** (`kubedb -> cnpg`): `pg_dump -> PVC -> pg_restore` into a CNPG `Cluster`. Different ground truth — see the **Postgres (kubedb -> cnpg)** section below.
+
+Only DSMs at `phase=AwaitingConfirmation` are scored; anything earlier (e.g. `PreflightComplete`) is reported as *in progress* and skipped — it isn't broken, just not ready to confirm.
+
+Read-only by default — it never annotates, restarts, or deletes a migration or its data. The optional `--source-check` mode is the one exception (redis-only): it creates and deletes a short-lived pod that mounts the source PVC `readOnly` (see below).
 
 **Default mode is light-touch:** two `kubectl logs`/`get` reads per DSM (conditions, rsync job, target-pod readiness, and the redis boot log) — no `exec`, no on-disk scan. The whole batch runs in seconds. The precise-but-heavy path — `exec redis-cli DBSIZE` plus a static scan of the on-disk `appendonlydir/*.incr.aof` — is behind `--deep`, for the ambiguous cases light-touch escalates to. `--source-check` and `--scan-source` imply `--deep`.
 
@@ -18,14 +25,22 @@ After running one or more `DatastoreMigration`s that are sitting at `AwaitingCon
 ## Run it
 
 ```bash
-~/.claude/skills/dsm-validate/scripts/dsm-validate.sh              # all namespaces, light-touch
-~/.claude/skills/dsm-validate/scripts/dsm-validate.sh idp auditlog # only these
-~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --deep greenhouse   # exec + on-disk AOF scan
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh              # all namespaces, all types, light-touch
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh idp auditlog # only these namespaces
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=postgres        # only postgres DSMs
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=redis,postgres  # csv; either type
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --deep greenhouse   # deep probe (exec)
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --deep greenhouse/foo-kubedb-to-ot # one DSM only (ns/name)
-~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --source-check   # deep + source-PVC scan
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --source-check   # deep + source-PVC scan (redis only)
 ```
 
 Requires `kubectl` (pointed at the right cluster/context) and `jq`.
+
+### Datastore types
+
+Each DSM is auto-classified by datastore type, and `--type=<csv>` restricts the batch to the type(s) you name (synonyms accepted: `pg`→`postgres`, `ot`/`opstree`→`redis`, `es`/`opensearch`→`elasticsearch`, `memcache`→`memcached`).
+
+**Supported today: `redis`, `postgres`.** Any other detected type (`memcached`, `elasticsearch`, `unknown`, …) is reported `UNSUPPORTED` — flagged for a manual look, never auto-GREEN. Adding a type is the forwards path and is deliberately small: write an `eval_<type>()` in the script, add a `case` arm to the `eval_dsm` dispatcher, and list the type in `SUPPORTED_TYPES`. The classifier prefers explicit signals (`spec.targetProvider`, the per-type `status.<type>` block) and falls back to the datastore name.
 
 ## What it checks per DSM
 
@@ -129,11 +144,32 @@ This only works while the migration is at `AwaitingConfirmation` (the source PVC
 
 > **Untested against a live source.** The `--source-check` path was written but never exercised end-to-end — there were no `AwaitingConfirmation` DSMs left when it was added. Sanity-check its output the first time you use it.
 
+## Postgres (kubedb -> cnpg)
+
+Everything above (rsync, `DBSIZE`, boot log, the 0-keys trap, `--source-check`) is **redis-only**. Postgres migrations are a different shape and are validated differently — but the CLI, flags, and GREEN/YELLOW/RED verdicts are the same.
+
+**The migration:** `pg_dump` on the source kubedb PVC → a dump PVC → `pg_restore` into a **CNPG `Cluster`** named after the datastore (`status.postgres.{dumpJobName,restoreJobName,dumpPVCName,sourcePVCName}` record the pieces). The dump/restore `Job`s are usually GC'd by the time a DSM reaches `AwaitingConfirmation`, so they are **not** a reliable signal — the ground truth is the CNPG cluster itself.
+
+**What it checks per DSM (light-touch default):**
+
+1. All `status.conditions` are `True` (same five: `PreflightComplete`, `OldInstanceStopped`, `DataSynced`, `NewInstanceReady`, `HandoffComplete`).
+2. The CNPG `Cluster` (name == datastore name) is **healthy**: `status.phase` is `Cluster in healthy state` and `status.readyInstances == spec.instances`. Primary pod is read from `status.currentPrimary` (CNPG numbers it `-1`, **not** the redis `-0`). Not healthy / missing → `RED`.
+3. **Data probe** (read-only `psql`, SELECT only, on the primary): lists non-system databases with `pg_database_size`, then for the largest (the app db) reports the **user-table count**, total size, and the **top 10 tables** by size with a `reltuples` row estimate. An app db with **0 user tables** → `YELLOW` (restore may not have landed). No non-system db at all → `YELLOW`.
+
+**`--deep`:** swaps the `reltuples` estimate for an exact `COUNT(*)` on each of the top-10 tables (heavier — one `psql` per table). Everything else is identical.
+
+`--source-check` / `--scan-source` are **not implemented** for postgres (they'd need to spin postgres on the source PVC); a postgres DSM targeted with them prints a note and validates the target cluster only.
+
+**Verdicts for postgres:**
+- **GREEN** — conditions all `True`, cluster healthy, app db present with ≥1 user table.
+- **YELLOW** — cluster healthy but the app db has 0 user tables, or no application db exists (restore may not have loaded). Investigate before confirming — cleanup deletes the source PVC.
+- **RED** — a condition is not `True`, or the CNPG cluster is missing / not healthy.
+
 ## Verdicts
 
 - **GREEN** — safe to confirm. The script prints the exact annotate command; run it yourself.
 - **YELLOW** — needs a human. Investigate (restart + re-check, or diff against the source PVC) before confirming.
-- **RED** — broken (a condition not True, rsync incomplete, or pod not Ready). Do not confirm.
+- **RED** — broken (a condition not True; for redis: rsync incomplete or pod not Ready; for postgres: CNPG cluster missing/unhealthy). Do not confirm.
 
 ## Confirming (you run this, not the skill)
 

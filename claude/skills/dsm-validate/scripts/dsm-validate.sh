@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
-# dsm-validate.sh — bulk validator for DatastoreMigration (kubedb Redis -> ot).
+# dsm-validate.sh — bulk validator for DatastoreMigration (kubedb -> cnpg/ot).
 #
 # Classifies every DSM into GREEN / YELLOW / RED so a batch of migrations can be
 # cleared at once. It never annotates/confirms, restarts, or deletes a migration or
 # its data. For GREEN migrations it prints the confirm-cleanup command for you to run.
+#
+# Two migration shapes are handled, auto-detected per DSM:
+#   * redis  (kubedb -> opstree): rsync + AOF/RDB boot-log logic (see the redis section).
+#   * postgres (kubedb -> cnpg): pg_dump -> PVC -> pg_restore into a CNPG Cluster named after
+#     the datastore. No rsync/boot log; ground truth is the CNPG cluster itself — is it healthy,
+#     and does the restored database carry the expected schema/size. Validation is read-only
+#     psql (SELECT only): database sizes, user-table count, and the largest tables. GREEN when
+#     the cluster is healthy and the app db has user tables; YELLOW when the app db is empty
+#     (restore may not have landed); RED when a condition is not True or the cluster is unhealthy.
+#     --deep swaps the reltuples row estimate for exact COUNT(*). --source-check is redis-only.
+#     Only DSMs at phase=AwaitingConfirmation are scored; earlier phases are still in progress.
 #
 # Default mode is READ-ONLY. rsync is trusted normally. The optional --source-check mode is the
 # one exception, and it escalates only SUSPICIOUS migrations (target DBSIZE==0, or the rsync log
@@ -23,11 +34,15 @@
 #   RED    — broken: a condition is not True, rsync not Complete, or target pod not Ready.
 #
 # Usage:
-#   dsm-validate.sh                                  # all namespaces, read-only (never scans source)
+#   dsm-validate.sh                                  # all namespaces, all types, read-only
 #   dsm-validate.sh idp auditlog                     # only these namespaces
+#   dsm-validate.sh --type=postgres                  # only postgres DSMs (csv: --type=redis,postgres)
 #   dsm-validate.sh --deep greenhouse/foo-kubedb-to-ot   # only this one DSM (ns/name), deep-probed
-#   dsm-validate.sh --scan-source=ns/name,ns2/n2     # source-check ONLY these specific DSMs (targeted)
-#   dsm-validate.sh --source-check                   # source-check EVERY suspicious DSM (unattended)
+#   dsm-validate.sh --scan-source=ns/name,ns2/n2     # source-check ONLY these specific DSMs (redis only)
+#   dsm-validate.sh --source-check                   # source-check EVERY suspicious DSM (redis only)
+#
+# Supported types today: redis, postgres. Others are detected and reported UNSUPPORTED (check by
+# hand) — adding one is an eval_<type>() + a dispatcher arm + a SUPPORTED_TYPES entry.
 #
 # Default run flags suspicious DSMs (dbsize 0 / rsync mismatch) but does not touch the source.
 # Decide per-DSM whether to escalate, then re-run with --scan-source for the ones you chose.
@@ -43,21 +58,41 @@ command -v jq >/dev/null || { echo "jq not found" >&2; exit 2; }
 DEEP=false              # --deep: exec into target + static on-disk AOF scan (heavy, precise)
 SCAN_ALL=false          # --source-check: scan every suspicious DSM (unattended); implies --deep
 scan_set=()             # --scan-source=ns/name,...: scan only these specific DSMs (targeted); implies --deep
+typefilter=()           # --type=redis,postgres,...: restrict the batch to these datastore types
 nsfilter=()
+
+# Datastore types with a validator today. New types (memcached, elasticsearch, ...) are the
+# forwards path: add "<type>" here and an eval_<type>() function, and the dispatcher picks it up.
+# A detected type not in this list falls through to eval_unsupported (verdict UNSUPPORTED).
+SUPPORTED_TYPES="redis postgres"
+
+# Normalize a user-supplied type token to the canonical datastore type used throughout.
+norm_type() {
+  case "$1" in
+    pg|postgre|postgres|postgresql|cnpg) echo postgres ;;
+    redis|ot|opstree)                    echo redis ;;
+    memcache|memcached)                  echo memcached ;;
+    es|elastic|elasticsearch|opensearch) echo elasticsearch ;;
+    *)                                   echo "$1" ;;
+  esac
+}
+
 for a in "$@"; do
   case "$a" in
     --deep) DEEP=true ;;
     --source-check) SCAN_ALL=true; DEEP=true ;;
     --scan-source=*) IFS=',' read -ra _s <<<"${a#*=}"; scan_set+=("${_s[@]}"); DEEP=true ;;
-    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
+    --type=*) IFS=',' read -ra _t <<<"${a#*=}"; for _x in "${_t[@]}"; do typefilter+=("$(norm_type "$_x")"); done ;;
+    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
     -*) echo "unknown flag: $a" >&2; exit 2 ;;
     *) nsfilter+=("$a") ;;
   esac
 done
 
 in_scanset() { local n; for n in "${scan_set[@]:-}"; do [ "$n" = "$1" ] && return 0; done; return 1; }
+in_typefilter() { [ "${#typefilter[@]}" -eq 0 ] && return 0; local t; for t in "${typefilter[@]}"; do [ "$t" = "$1" ] && return 0; done; return 1; }
 
-green=(); yellow=(); red=(); err=(); completed=0
+green=(); yellow=(); red=(); err=(); unsupported=(); completed=0; pending=0; filtered=0
 
 # In-pod probe (target): emits KEY=VALUE facts. Reads DBSIZE and single-pass scans the on-disk
 # incr AOF for non-health-checker SET keys, split into total (NONHC) vs genuinely durable /
@@ -157,19 +192,35 @@ mapfile -t rows < <(kubectl get dsm --all-namespaces -o json | jq -r '
     .metadata.namespace, .metadata.name, .spec.datastoreRef.name, (.status.phase // "Unknown"),
     ([.status.conditions[]? | select(.status=="True")] | length),
     ([.status.conditions[]?] | length),
+    (
+      # Datastore type, derived from the DSM. Prefer explicit signals (target provider, the
+      # per-type status block); fall back to the datastore name. Add new arms as validators land.
+      if   (.spec.targetProvider=="cnpg") or (.status.postgres!=null) then "postgres"
+      elif (.status.redis!=null) then "redis"
+      elif (.status.memcached!=null) then "memcached"
+      elif (.status.elasticsearch!=null) then "elasticsearch"
+      else ((.spec.datastoreRef.name // .metadata.name // "") |
+        if   test("postgres|cnpg|-pg-") then "postgres"
+        elif test("redis")              then "redis"
+        elif test("memcache")           then "memcached"
+        elif test("elastic|opensearch") then "elasticsearch"
+        else "unknown" end)
+      end
+    ),
     (.status.redis.rsyncJobName // ""),
-    (.status.redis.sourcePVCName // "")
+    (.status.redis.sourcePVCName // ""),
+    (.status.postgres.sourcePVCName // "")
   ] | @tsv')
 
 [ "${#rows[@]}" -eq 0 ] && { echo "No DatastoreMigrations found."; exit 0; }
 
 in_filter() { [ "${#nsfilter[@]}" -eq 0 ] && return 0; local n; for n in "${nsfilter[@]}"; do { [ "$n" = "$1" ] || [ "$n" = "$1/$2" ]; } && return 0; done; return 1; }
 
-# eval_dsm <ns> <name> <ds> <phase> <ctrue> <ctot> <rsync> <srcpvc>
-# Evaluates one DSM and prints its findings, ending with a machine-readable RESULT=<verdict>
-# line. Called inside a command-substitution subshell so a fatal error (unbound var, aborted
-# probe) is contained to this one DSM and never aborts the whole batch.
-eval_dsm() {
+# eval_redis <ns> <name> <ds> <phase> <ctrue> <ctot> <rsync> <srcpvc>
+# Evaluates one redis (kubedb -> opstree) DSM and prints its findings, ending with a
+# machine-readable RESULT=<verdict> line. Called inside a command-substitution subshell so a
+# fatal error (unbound var, aborted probe) is contained to this one DSM and never aborts the batch.
+eval_redis() {
   local ns="$1" name="$2" ds="$3" phase="$4" ctrue="$5" ctot="$6" rsync="$7" srcpvc="$8"
   local verdict="GREEN"; local notes=()
 
@@ -328,9 +379,127 @@ eval_dsm() {
   echo "RESULT=$verdict"
 }
 
+# eval_postgres <ns> <name> <ds> <phase> <ctrue> <ctot> <srcpvc>
+# Evaluates one postgres (kubedb -> cnpg) DSM. The migration is pg_dump (source) -> PVC ->
+# pg_restore into a CNPG Cluster named after the datastore ($ds). There is no rsync or redis
+# boot log; the dump/restore Jobs are often GC'd by the time this runs. Ground truth for "did
+# the data land" is the CNPG cluster itself: is it healthy, and does the restored database
+# carry the expected schema/size. Read-only — only SELECTs via psql on the primary.
+eval_postgres() {
+  local ns="$1" name="$2" ds="$3" phase="$4" ctrue="$5" ctot="$6" srcpvc="$7"
+  local verdict="GREEN"; local notes=()
+  local cl clphase inst ready primary
+  local dbrows appdb tcount appsize tbls t rows sz c
+
+  if [ "$ctot" -eq 0 ] || [ "$ctrue" -ne "$ctot" ]; then
+    verdict="RED"; notes+=("conditions ${ctrue}/${ctot} True")
+  fi
+
+  # CNPG cluster (name == datastore name). Healthy = phase says so AND readyInstances==instances.
+  cl=$(kubectl get cluster.postgresql.cnpg.io "$ds" -n "$ns" -o json 2>/dev/null || true)
+  if [ -z "$cl" ]; then
+    verdict="RED"; notes+=("CNPG cluster $ds not found in ns $ns")
+    echo "  phase=$phase conditions=${ctrue}/${ctot} cluster=MISSING"
+    printf '  VERDICT: %s\n' "$verdict"
+    for n in "${notes[@]}"; do echo "    - $n"; done
+    echo "RESULT=$verdict"; return
+  fi
+  clphase=$(jq -r '.status.phase // "?"' <<<"$cl")
+  inst=$(jq -r '.spec.instances // 1' <<<"$cl")
+  ready=$(jq -r '.status.readyInstances // 0' <<<"$cl")
+  primary=$(jq -r '.status.currentPrimary // ""' <<<"$cl")
+  if [ "${ready:-0}" -lt "${inst:-1}" ] 2>/dev/null || [ -z "$primary" ]; then
+    verdict="RED"; notes+=("CNPG cluster not healthy (phase=\"$clphase\" ready=${ready}/${inst})")
+  fi
+
+  echo "  phase=$phase conditions=${ctrue}/${ctot} cluster=\"$clphase\" ready=${ready}/${inst} primary=${primary:-none}"
+
+  # Data probe (read-only SELECTs) — only if there's a reachable primary. Even a RED cluster is
+  # worth probing if a primary exists, so the operator can see what (if anything) landed.
+  if [ -n "$primary" ]; then
+    # Non-system databases with size (biggest first); the app db is the largest of these.
+    dbrows=$(kubectl exec -n "$ns" "$primary" -c postgres -- psql -U postgres -tA -F'|' -c \
+      "SELECT datname, pg_size_pretty(pg_database_size(datname)) FROM pg_database WHERE datistemplate=false AND datname<>'postgres' ORDER BY pg_database_size(datname) DESC;" 2>/dev/null | tr -d '\r' || true)
+    if [ -z "$dbrows" ]; then
+      [ "$verdict" != "RED" ] && verdict="YELLOW"
+      notes+=("no application database on target (only system dbs) — restore may not have landed; do not confirm")
+      echo "  databases: (none besides system)"
+    else
+      echo "  databases: $(awk -F'|' '{printf "%s%s (%s)", (NR>1?", ":""), $1, $2} END{print ""}' <<<"$dbrows")"
+      appdb=$(head -1 <<<"$dbrows" | cut -d'|' -f1)
+      tcount=$(kubectl exec -n "$ns" "$primary" -c postgres -- psql -U postgres -d "$appdb" -tA -c \
+        "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema');" 2>/dev/null | tr -d '\r' || true)
+      tcount=${tcount:-0}
+      appsize=$(kubectl exec -n "$ns" "$primary" -c postgres -- psql -U postgres -d "$appdb" -tA -c \
+        "SELECT pg_size_pretty(pg_database_size('$appdb'));" 2>/dev/null | tr -d '\r' || true)
+      echo "  app db '$appdb': ${tcount} user tables, ${appsize:-?}"
+      if [ "${tcount:-0}" -eq 0 ] 2>/dev/null; then
+        [ "$verdict" != "RED" ] && verdict="YELLOW"
+        notes+=("app db '$appdb' has 0 user tables — restore may not have loaded; do not confirm")
+      elif $DEEP; then
+        # --deep: exact COUNT(*) for the largest tables (heavier; iterates per table).
+        tbls=$(kubectl exec -n "$ns" "$primary" -c postgres -- psql -U postgres -d "$appdb" -tA -F'|' -c \
+          "SELECT n.nspname||'.'||c.relname, pg_size_pretty(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 10;" 2>/dev/null | tr -d '\r' || true)
+        while IFS='|' read -r t sz; do
+          [ -z "$t" ] && continue
+          c=$(kubectl exec -n "$ns" "$primary" -c postgres -- psql -U postgres -d "$appdb" -tA -c "SELECT count(*) FROM \"${t%%.*}\".\"${t#*.}\";" 2>/dev/null | tr -d '\r' || true)
+          echo "    $t  ${c:-?} rows  ${sz}"
+        done <<<"$tbls"
+        [ "$tcount" -gt 10 ] 2>/dev/null && echo "    ... ($((tcount-10)) more tables)"
+      else
+        # Default: reltuples estimate (cheap, from the catalog; -1 means never analyzed).
+        tbls=$(kubectl exec -n "$ns" "$primary" -c postgres -- psql -U postgres -d "$appdb" -tA -F'|' -c \
+          "SELECT n.nspname||'.'||c.relname, c.reltuples::bigint, pg_size_pretty(pg_total_relation_size(c.oid)) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind='r' AND n.nspname NOT IN ('pg_catalog','information_schema') ORDER BY pg_total_relation_size(c.oid) DESC LIMIT 10;" 2>/dev/null | tr -d '\r' || true)
+        while IFS='|' read -r t rows sz; do
+          [ -z "$t" ] && continue
+          [ "$rows" = "-1" ] && rows="?"
+          echo "    $t  ~${rows} rows  ${sz}"
+        done <<<"$tbls"
+        [ "$tcount" -gt 10 ] 2>/dev/null && echo "    ... ($((tcount-10)) more tables)"
+      fi
+    fi
+  fi
+
+  if { $SCAN_ALL || in_scanset "$ns/$name"; } && [ -n "$srcpvc" ]; then
+    echo "  note: --source-check/--scan-source is redis-only; validated the target cluster only"
+  fi
+
+  printf '  VERDICT: %s\n' "$verdict"
+  ((${#notes[@]})) && for n in "${notes[@]}"; do echo "    - $n"; done
+  if [ "$verdict" = "GREEN" ]; then
+    echo "    confirm: kubectl annotate DatastoreMigration -n $ns $name datastore.greenhouse.io/migration-confirm-cleanup=true"
+  fi
+  echo "RESULT=$verdict"
+}
+
+# eval_unsupported <ns> <name> <phase> <kind>
+# A DSM whose datastore type has no validator yet. Never GREEN — the operator must check it
+# by hand. This is the graceful landing spot until an eval_<kind>() is added for that type.
+eval_unsupported() {
+  local ns="$1" name="$2" phase="$3" kind="$4"
+  echo "  phase=$phase type=$kind — no validator implemented for '$kind' yet"
+  printf '  VERDICT: %s\n' "UNSUPPORTED"
+  echo "    - dsm-validate has no '$kind' evaluator (supported: ${SUPPORTED_TYPES}); inspect manually — NOT auto-safe to confirm"
+  echo "RESULT=UNSUPPORTED"
+}
+
+# eval_dsm — dispatch to the per-type evaluator based on <kind> (arg 7). To add a type, drop in
+# an eval_<type>() and a case arm here, and list it in SUPPORTED_TYPES.
+# args: <ns> <name> <ds> <phase> <ctrue> <ctot> <kind> <rsync> <redis_srcpvc> <pg_srcpvc>
+eval_dsm() {
+  case "$7" in
+    postgres) eval_postgres "$1" "$2" "$3" "$4" "$5" "$6" "${10}" ;;
+    redis)    eval_redis    "$1" "$2" "$3" "$4" "$5" "$6" "$8" "$9" ;;
+    *)        eval_unsupported "$1" "$2" "$4" "$7" ;;
+  esac
+}
+
 for row in "${rows[@]}"; do
-  IFS=$'\t' read -r ns name ds phase ctrue ctot rsync srcpvc <<<"$row"
+  IFS=$'\t' read -r ns name ds phase ctrue ctot kind rsync redis_srcpvc pg_srcpvc <<<"$row"
   in_filter "$ns" "$name" || continue
+
+  # --type filter: restrict the batch to the requested datastore type(s). Skip others silently.
+  if ! in_typefilter "$kind"; then filtered=$((filtered + 1)); continue; fi
 
   # Completed DSMs are already confirmed — nothing to validate. Skip silently
   # (count them for the summary) so the output is only the actionable ones.
@@ -339,27 +508,39 @@ for row in "${rows[@]}"; do
     continue
   fi
 
+  # Only AwaitingConfirmation is confirmable. Anything else (PreflightComplete, mid-migration)
+  # is still in progress — not broken, but not ready. Note it briefly and don't score it.
+  if [ "$phase" != "AwaitingConfirmation" ]; then
+    pending=$((pending + 1))
+    echo "──────────────────────────────────────────────"
+    echo "$ns/$name  (datastore=$ds)  [$kind]"
+    echo "  phase=$phase — migration in progress; not yet at AwaitingConfirmation, nothing to confirm"
+    continue
+  fi
+
   echo "──────────────────────────────────────────────"
-  echo "$ns/$name  (datastore=$ds)"
+  echo "$ns/$name  (datastore=$ds)  [$kind]"
 
   # Fault-isolation: evaluate in a subshell so a fatal error in one DSM (unbound var, an
   # aborted probe) degrades to ERROR for that DSM only — the batch keeps going. stderr still
   # surfaces; a missing RESULT line means the eval aborted.
-  out=$(eval_dsm "$ns" "$name" "$ds" "$phase" "$ctrue" "$ctot" "$rsync" "$srcpvc" 2>&1) || true
+  out=$(eval_dsm "$ns" "$name" "$ds" "$phase" "$ctrue" "$ctot" "$kind" "$rsync" "$redis_srcpvc" "$pg_srcpvc" 2>&1) || true
   sed '/^RESULT=/d' <<<"$out"
   verdict=$(sed -n 's/^RESULT=//p' <<<"$out" | tail -1)
 
   case "${verdict:-ERROR}" in
-    GREEN)  green+=("$ns/$name") ;;
-    YELLOW) yellow+=("$ns/$name") ;;
-    RED)    red+=("$ns/$name") ;;
-    *)      err+=("$ns/$name"); echo "  VERDICT: ERROR — evaluation aborted (see message above); NOT safe to confirm" ;;
+    GREEN)       green+=("$ns/$name") ;;
+    YELLOW)      yellow+=("$ns/$name") ;;
+    RED)         red+=("$ns/$name") ;;
+    UNSUPPORTED) unsupported+=("$ns/$name ($kind)") ;;
+    *)           err+=("$ns/$name"); echo "  VERDICT: ERROR — evaluation aborted (see message above); NOT safe to confirm" ;;
   esac
 done
 
 echo "══════════════════════════════════════════════"
-echo "SUMMARY: ${#green[@]} GREEN  ${#yellow[@]} YELLOW  ${#red[@]} RED  ${#err[@]} ERROR  (${completed} Completed skipped)"
-[ "${#yellow[@]}" -gt 0 ] && printf '  YELLOW (needs human): %s\n' "${yellow[*]}"
-[ "${#red[@]}" -gt 0 ]    && printf '  RED (broken):         %s\n' "${red[*]}"
-[ "${#err[@]}" -gt 0 ]    && printf '  ERROR (eval failed):  %s\n' "${err[*]}"
+echo "SUMMARY: ${#green[@]} GREEN  ${#yellow[@]} YELLOW  ${#red[@]} RED  ${#unsupported[@]} UNSUPPORTED  ${#err[@]} ERROR  (${pending} in progress, ${completed} Completed skipped, ${filtered} filtered by --type)"
+[ "${#yellow[@]}" -gt 0 ]      && printf '  YELLOW (needs human): %s\n' "${yellow[*]}"
+[ "${#red[@]}" -gt 0 ]         && printf '  RED (broken):         %s\n' "${red[*]}"
+[ "${#unsupported[@]}" -gt 0 ] && printf '  UNSUPPORTED (no validator; check by hand): %s\n' "${unsupported[*]}"
+[ "${#err[@]}" -gt 0 ]         && printf '  ERROR (eval failed):  %s\n' "${err[*]}"
 exit 0
