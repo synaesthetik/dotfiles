@@ -152,6 +152,23 @@ dot_doctor() {
   echo "dot doctor: all checks passed"
 }
 
+dot_lint() {
+  local -a files=(
+    "$REPO_DIR/bootstrap.sh"
+    "$REPO_DIR/macos.sh"
+    "$REPO_DIR/scripts/scan-secrets.sh"
+    "$REPO_DIR/bin/dot"
+  )
+
+  echo "dot lint: running shellcheck..."
+  shellcheck "${files[@]}"
+
+  echo "dot lint: running shfmt -d (rules from .editorconfig)..."
+  shfmt -d "${files[@]}"
+
+  echo "dot lint: all checks passed"
+}
+
 dot_uninstall() {
   local assume_yes=0
   local pkg=""
@@ -205,6 +222,7 @@ Commands:
   update      git pull + brew bundle + restow (fails fast on dirty tree)
   doctor      report stow/Brewfile health (--fix re-stows broken symlinks)
   uninstall   stow -D a package's symlinks (all if omitted; prompts unless --yes)
+  lint        run shellcheck + shfmt -d over own scripts (CI parity)
   help        show this message
 EOF
 }
@@ -215,6 +233,7 @@ case "${1:-help}" in
   update)  shift; dot_update "$@" ;;
   uninstall) shift; dot_uninstall "$@" ;;
   doctor) shift; dot_doctor "$@" ;;
+  lint) shift; dot_lint "$@" ;;
   help|--help|-h) dot_help ;;
   *)
     echo "dot: unknown subcommand '${1:-}'" >&2
