@@ -42,7 +42,7 @@ dot_stow() {
 }
 
 dot_install() {
-  if ! command -v brew >/dev/null 2>&1; then
+  if ! command -v brew > /dev/null 2>&1; then
     echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
     exit 1
   fi
@@ -59,7 +59,7 @@ dot_update() {
 
   git -C "$REPO_DIR" pull
 
-  if ! command -v brew >/dev/null 2>&1; then
+  if ! command -v brew > /dev/null 2>&1; then
     echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
     exit 1
   fi
@@ -75,8 +75,14 @@ dot_doctor() {
   local fix=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      --fix) fix=1; shift ;;
-      -*) echo "dot: unknown flag '$1'" >&2; exit 1 ;;
+      --fix)
+        fix=1
+        shift
+        ;;
+      -*)
+        echo "dot: unknown flag '$1'" >&2
+        exit 1
+        ;;
       *) shift ;;
     esac
   done
@@ -92,7 +98,7 @@ dot_doctor() {
     while IFS= read -r file; do
       rel="${file#"$REPO_DIR"/"$pkg"/}"
       case "$rel" in
-        .stow-local-ignore|*.example) continue ;;
+        .stow-local-ignore | *.example) continue ;;
       esac
 
       dest="$target/$rel"
@@ -130,7 +136,7 @@ dot_doctor() {
     unresolved=$((unresolved - ${#broken_pkgs[@]}))
   fi
 
-  if ! command -v brew >/dev/null 2>&1; then
+  if ! command -v brew > /dev/null 2>&1; then
     echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
     exit 1
   fi
@@ -175,17 +181,29 @@ dot_uninstall() {
 
   while [ $# -gt 0 ]; do
     case "$1" in
-      --yes|-y) assume_yes=1; shift ;;
-      -*) echo "dot: unknown flag '$1'" >&2; exit 1 ;;
-      *) pkg="$1"; shift ;;
+      --yes | -y)
+        assume_yes=1
+        shift
+        ;;
+      -*)
+        echo "dot: unknown flag '$1'" >&2
+        exit 1
+        ;;
+      *)
+        pkg="$1"
+        shift
+        ;;
     esac
   done
 
   if [ -t 0 ] && [ "$assume_yes" -ne 1 ]; then
     read -r -p "Remove ${pkg:-all} symlinks from \$HOME? [y/N] " reply
     case "$reply" in
-      y|Y|yes|YES) : ;;
-      *) echo "dot: aborted" >&2; exit 1 ;;
+      y | Y | yes | YES) : ;;
+      *)
+        echo "dot: aborted" >&2
+        exit 1
+        ;;
     esac
   fi
 
@@ -211,7 +229,7 @@ dot_uninstall() {
 }
 
 dot_help() {
-  cat <<'EOF'
+  cat << 'EOF'
 dot -- dotfiles management CLI
 
 Usage: dot <command>
@@ -228,13 +246,31 @@ EOF
 }
 
 case "${1:-help}" in
-  install) shift; dot_install "$@" ;;
-  stow)    shift; dot_stow "$@" ;;
-  update)  shift; dot_update "$@" ;;
-  uninstall) shift; dot_uninstall "$@" ;;
-  doctor) shift; dot_doctor "$@" ;;
-  lint) shift; dot_lint "$@" ;;
-  help|--help|-h) dot_help ;;
+  install)
+    shift
+    dot_install "$@"
+    ;;
+  stow)
+    shift
+    dot_stow "$@"
+    ;;
+  update)
+    shift
+    dot_update "$@"
+    ;;
+  uninstall)
+    shift
+    dot_uninstall "$@"
+    ;;
+  doctor)
+    shift
+    dot_doctor "$@"
+    ;;
+  lint)
+    shift
+    dot_lint "$@"
+    ;;
+  help | --help | -h) dot_help ;;
   *)
     echo "dot: unknown subcommand '${1:-}'" >&2
     dot_help

@@ -465,6 +465,10 @@ skip_if_brewfile_dirty() {
 @test "macos.sh is never invoked from bootstrap.sh or bin/dot" {
   skip_if_no_macos_script
 
-  run bash -c "grep -n 'macos.sh' '$REPO_DIR/bootstrap.sh' '$REPO_DIR/bin/dot'"
+  # dot_lint()'s explicit lint-target array legitimately references
+  # "$REPO_DIR/macos.sh" as a static-analysis argument (CI-01) -- that is
+  # not an invocation. Exclude that one known-safe array-literal line and
+  # assert no other (invoking) reference to macos.sh remains.
+  run bash -c "grep -n 'macos.sh' '$REPO_DIR/bootstrap.sh' '$REPO_DIR/bin/dot' | grep -v '\"\$REPO_DIR/macos\.sh\"[[:space:]]*\$'"
   [ "$status" -ne 0 ]
 }
