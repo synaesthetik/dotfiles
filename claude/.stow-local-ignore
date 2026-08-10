@@ -4,3 +4,6 @@
 # symlinked into $HOME (Stow's built-in defaults are discarded once a
 # .stow-local-ignore exists — see 01-RESEARCH.md Pitfall 3).
 \.DS_Store
+# Configures this repo's own tooling (dot doctor's untracked-skill report);
+# it has no meaning inside ~/.claude, so it must never be symlinked out.
+skills-ignore

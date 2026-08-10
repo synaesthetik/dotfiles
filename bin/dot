@@ -41,6 +41,103 @@ dot_stow() {
   esac
 }
 
+# True if $1 matches any glob in claude/skills-ignore.
+skill_is_ignored() {
+  local name="$1" ignore_file="$REPO_DIR/claude/skills-ignore" pattern
+
+  [ -f "$ignore_file" ] || return 1
+
+  while IFS= read -r pattern || [ -n "$pattern" ]; do
+    case "$pattern" in
+      '' | '#'*) continue ;;
+    esac
+    # shellcheck disable=SC2254 # the pattern is a glob on purpose
+    case "$name" in
+      $pattern) return 0 ;;
+    esac
+  done < "$ignore_file"
+
+  return 1
+}
+
+# Skills that exist in $HOME but not in the repo. Stow only projects
+# repo -> $HOME, so this is the one drift direction it structurally cannot
+# see -- and it is the direction Claude Code writes in.
+dot_untracked_skills() {
+  local home_skills="$HOME/.claude/skills" dir name
+
+  [ -d "$home_skills" ] || return 0
+
+  for dir in "$home_skills"/*/; do
+    [ -d "$dir" ] || continue
+    name="$(basename "$dir")"
+    skill_is_ignored "$name" && continue
+    [ -e "$REPO_DIR/claude/skills/$name" ] && continue
+    echo "$name"
+  done
+}
+
+dot_adopt() {
+  local skill="${1:-}"
+
+  if [ -z "$skill" ]; then
+    echo "dot adopt: usage: dot adopt <skill-name>" >&2
+    echo "dot adopt: run 'dot doctor' to list untracked skills" >&2
+    exit 1
+  fi
+
+  local src="$HOME/.claude/skills/$skill"
+  local dest="$REPO_DIR/claude/skills/$skill"
+
+  if [ ! -d "$src" ]; then
+    echo "dot adopt: '$skill' not found at $src" >&2
+    exit 1
+  fi
+
+  if [ -e "$dest" ]; then
+    echo "dot adopt: '$skill' is already tracked at $dest -- nothing to do" >&2
+    exit 1
+  fi
+
+  # Order matters: this check must precede the symlink check below. The
+  # repo's own git config sets an init template whose hooks are stow symlinks,
+  # so any nested clone necessarily contains symlinks under .git/hooks and
+  # would otherwise be misreported as "already stow-managed".
+  #
+  # A skill that is its own clone belongs to someone else. Copying it in would
+  # either vendor a third-party repo or leave a 160000 gitlink under
+  # claude/skills/, which post-stow.bats forbids. Record it in
+  # claude/skills-ignore with its upstream URL instead.
+  if [ -e "$src/.git" ]; then
+    echo "dot adopt: '$skill' is its own git repo (nested clone) -- refusing to vendor it into this repo" >&2
+    echo "dot adopt: add it to claude/skills-ignore with its upstream URL so a fresh machine can re-clone it" >&2
+    exit 1
+  fi
+
+  # A skill already holding symlinks is one stow has projected; copying it
+  # would capture links rather than content.
+  if find "$src" -type l | grep -q .; then
+    echo "dot adopt: '$skill' already contains symlinks -- it appears to be stow-managed already, refusing to copy" >&2
+    exit 1
+  fi
+
+  # Copy-verify-then-remove, never move: a partial move would destroy the only
+  # copy of a skill that exists nowhere else.
+  cp -R "$src" "$dest"
+
+  if ! diff -r "$src" "$dest" > /dev/null 2>&1; then
+    rm -rf "$dest"
+    echo "dot adopt: copy verification failed for '$skill' -- repo left unchanged, \$HOME untouched" >&2
+    exit 1
+  fi
+
+  rm -rf "${src:?}"
+  dot_stow claude
+
+  echo "dot adopt: '$skill' is now tracked in claude/skills/$skill and symlinked back into \$HOME"
+  echo "dot adopt: review and commit it -- it is not committed automatically"
+}
+
 dot_install() {
   if ! command -v brew > /dev/null 2>&1; then
     echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
@@ -98,7 +195,7 @@ dot_doctor() {
     while IFS= read -r file; do
       rel="${file#"$REPO_DIR"/"$pkg"/}"
       case "$rel" in
-        .stow-local-ignore | *.example) continue ;;
+        .stow-local-ignore | skills-ignore | *.example) continue ;;
       esac
 
       dest="$target/$rel"
@@ -139,6 +236,19 @@ dot_doctor() {
   if ! command -v brew > /dev/null 2>&1; then
     echo "dot: Homebrew not found. Run ./bootstrap.sh first." >&2
     exit 1
+  fi
+
+  local untracked skill_count=0
+  untracked="$(dot_untracked_skills)"
+  if [ -n "$untracked" ]; then
+    while IFS= read -r skill; do
+      [ -z "$skill" ] && continue
+      echo "dot doctor: untracked skill '$skill' exists in ~/.claude/skills but not in the repo -- run 'dot adopt $skill' to capture it" >&2
+      skill_count=$((skill_count + 1))
+    done << EOF
+$untracked
+EOF
+    unresolved=$((unresolved + skill_count))
   fi
 
   # `brew bundle check` exits non-zero for two very different reasons, and the
@@ -253,7 +363,8 @@ Commands:
   install     brew bundle + stow every package (run after ./bootstrap.sh)
   stow [pkg]  stow a single package (zsh, git, claude) or all if omitted
   update      git pull + brew bundle + restow (fails fast on dirty tree)
-  doctor      report stow/Brewfile health (--fix re-stows broken symlinks)
+  adopt SKILL move a skill from ~/.claude/skills into the repo and symlink it back
+  doctor      report stow/Brewfile/skill-drift health (--fix re-stows broken symlinks)
   uninstall   stow -D a package's symlinks (all if omitted; prompts unless --yes)
   lint        run shellcheck + shfmt -d over own scripts (CI parity)
   help        show this message
@@ -272,6 +383,10 @@ case "${1:-help}" in
   update)
     shift
     dot_update "$@"
+    ;;
+  adopt)
+    shift
+    dot_adopt "$@"
     ;;
   uninstall)
     shift

@@ -1,0 +1,13 @@
+# Skills under ~/.claude/skills that this repo deliberately does not track.
+# One shell glob per line; blank lines and #-comments are ignored.
+#
+# `dot doctor` compares ~/.claude/skills against claude/skills/ and reports
+# anything present in $HOME but absent from the repo, since Claude Code writes
+# new skills straight into $HOME where stow will never see them. Entries here
+# are exempt from that report.
+#
+# This file is intentionally NOT stowed (see claude/.stow-local-ignore) -- it
+# configures the repo's own tooling and has no meaning inside ~/.claude.
+
+# Installed and updated by the GSD installer, which owns their lifecycle.
+gsd-*
