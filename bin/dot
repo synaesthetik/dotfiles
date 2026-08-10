@@ -141,12 +141,27 @@ dot_doctor() {
     exit 1
   fi
 
+  # `brew bundle check` exits non-zero for two very different reasons, and the
+  # exit status alone cannot tell them apart. When brew's dependency sorter
+  # aborts (e.g. a circular dependency between formulae), it gives up before
+  # evaluating anything and then lists *every* Brewfile formula as needing
+  # installation -- including ones that are installed and on PATH. Reporting
+  # that as missing packages points at `dot update`, which runs the same check
+  # and fails identically, while hiding any genuine drift in the noise.
   local brew_output
   if brew_output="$(brew bundle check --verbose --file="$REPO_DIR/Brewfile" 2>&1)"; then
     :
   else
     echo "$brew_output" >&2
-    echo "dot doctor: missing Brewfile-declared packages -- run 'dot update' to install missing packages" >&2
+    case "$brew_output" in
+      *"can't satisfy your Brewfile's dependencies"* | *"circular dependency"*)
+        echo "dot doctor: the Brewfile check could not be evaluated -- brew aborted before inspecting any formula, so the list above is not a real inventory of what is missing" >&2
+        echo "dot doctor: 'dot update' will not fix this (it runs the same check); resolve the brew-side dependency error first" >&2
+        ;;
+      *)
+        echo "dot doctor: missing Brewfile-declared packages -- run 'dot update' to install missing packages" >&2
+        ;;
+    esac
     unresolved=$((unresolved + 1))
   fi
 
