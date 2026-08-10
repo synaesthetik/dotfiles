@@ -41,3 +41,5 @@
 	allowed = :bogus[a-z]*@
 [core]
 	excludesfile = ~/.config/git/ignore
+[safe]
+	directory = /todo
