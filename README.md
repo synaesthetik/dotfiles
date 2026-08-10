@@ -50,8 +50,10 @@ Once `bin/` is on your `PATH` (the `zsh` package adds it), a dependency-free
 dot install     brew bundle + stow every package (run after ./bootstrap.sh)
 dot stow [pkg]  stow a single package (zsh, git, claude) or all if omitted
 dot update      git pull + brew bundle + restow (fails fast on dirty tree)
-dot doctor      report stow/Brewfile health (--fix re-stows broken symlinks)
+dot adopt SKILL move a skill from ~/.claude/skills into the repo and symlink it back
+dot doctor      report stow/Brewfile/skill-drift health (--fix re-stows broken symlinks)
 dot uninstall   stow -D a package's symlinks (all if omitted; prompts unless --yes)
+dot lint        run shellcheck + shfmt -d over own scripts (CI parity)
 dot help        show this message
 ```
 
@@ -69,6 +71,33 @@ dot help        show this message
 - `dot update` aborts fast — before touching anything — if the repo has a
   dirty working tree (`commit or stash first`). Once clean, it runs `git
   pull` → `brew bundle` → `stow -R` in one call, idempotent to re-run.
+
+## Keeping Claude skills in sync
+
+Stow only projects *repo → `$HOME`*. Claude Code writes new skills straight
+into `~/.claude/skills/` as real directories, so anything authored on this
+machine is invisible to the repo until it's captured. `dot doctor` reports
+that drift; `dot adopt <skill>` captures it.
+
+Skills fall into three classes:
+
+1. **Repo-owned** — live in `claude/skills/`, stowed into `~/.claude/skills/`
+   as per-file symlinks. Edits go live instantly and show up in `git status`.
+2. **Externally managed** — the skill directory is a clone, or symlinks into
+   another checkout. `dot adopt` deliberately refuses these rather than
+   vendoring someone else's repo. List them in `claude/skills-ignore` with
+   their restore command so a fresh Mac can rebuild them.
+3. **Installer-managed** — `gsd-*`, owned by the GSD installer. Ignored by
+   default.
+
+`claude/skills-ignore` holds one shell glob per line and exempts a skill from
+the drift report. It is not stowed — it configures this repo's tooling and has
+no meaning inside `~/.claude`.
+
+`dot adopt` copies, verifies with `diff -r`, and only then removes the
+original — never a bare `mv`, since a partial move would destroy the only copy
+of a skill that exists nowhere else. It stops rather than proceeding if the
+skill is its own git clone or already contains symlinks.
 
 ## macOS system defaults
 

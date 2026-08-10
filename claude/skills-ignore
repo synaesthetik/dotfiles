@@ -11,3 +11,20 @@
 
 # Installed and updated by the GSD installer, which owns their lifecycle.
 gsd-*
+
+# Upstream clone -- ~/.claude/skills/humanizer is its own git checkout.
+# Restore on a new machine with:
+#   git clone https://github.com/blader/humanizer.git ~/.claude/skills/humanizer
+humanizer
+
+# Developed in its own repo at ~/code/datastore-doctor; the entries under
+# ~/.claude/skills/datastore-doctor are symlinks into that checkout, so the
+# skill is already version-controlled -- just not by this repo.
+#
+# WARNING: as of 2026-08-10 that repo has NO REMOTE configured, so it exists
+# only on this machine and no bootstrap can restore it. Give it a remote and
+# push before treating a fresh-Mac rebuild as complete.
+#
+# Note also that ~/.claude/skills/datastore-doctor/SESSION-FINDINGS.md is a
+# real file rather than a symlink -- it is tracked by neither repo.
+datastore-doctor
