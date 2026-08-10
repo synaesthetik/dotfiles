@@ -1,3 +1,13 @@
+# Must stay the first executable line: p10k's instant prompt refuses to engage
+# if anything has already written to stdout, and it is what masks the ~1.2s of
+# compinit + prompt initialisation that dominates interactive startup.
+# `quiet` suppresses the console-output warning that the vscode/lotus
+# integrations below would otherwise trip.
+typeset -g POWERLEVEL9K_INSTANT_PROMPT=quiet
+if [[ -r "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh" ]]; then
+  source "${XDG_CACHE_HOME:-$HOME/.cache}/p10k-instant-prompt-${(%):-%n}.zsh"
+fi
+
 ### PATH ###
 export PATH=$HOME/bin:/usr/local/bin:/Users/patrick.lewis/code/infrastructure/bin:/usr/local/go/bin:$PATH
 export PATH=$HOME/.asdf/shims:$PATH
@@ -8,8 +18,8 @@ export PATH="${KREW_ROOT:-$HOME/.krew}/bin:$PATH"
 export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH"
 export PATH="/opt/homebrew/opt/libpq/bin:$PATH"
 export PATH="${${${(%):-%x}:A}:h:h}/bin:$PATH"
-export LIBPQ_INCLUDE_DIR=$(brew --prefix libpq)/include
-export LIBPQ_LIB_DIR=$(brew --prefix libpq)/lib
+export LIBPQ_INCLUDE_DIR=${HOMEBREW_PREFIX:-/opt/homebrew}/opt/libpq/include
+export LIBPQ_LIB_DIR=${HOMEBREW_PREFIX:-/opt/homebrew}/opt/libpq/lib
 export INFRA_HOME=/Users/patrick.lewis/code/infrastructure
 
 ### THEME ###
@@ -52,8 +62,12 @@ export PGDATA=/var/lib/postgresql/data/pgdata
 export PYENV_ROOT=/Users/patrick.lewis/.pyenv
 export PYENV_ROOT="$HOME/.pyenv"
 export VIRTUAL_ENV_DISABLE_PROMPT=1
-if which pyenv > /dev/null; then eval "$(pyenv init - zsh)"; fi
-if which pyenv-virtualenv-init > /dev/null; then eval "$(pyenv virtualenv-init - zsh)"; fi
+# --no-rehash skips rebuilding the shim directory on every shell start (114ms
+# for pyenv, 59ms for nodenv). Shims are regenerated at install time, so the
+# per-launch rebuild is redundant; run `pyenv rehash` by hand after an install
+# that somehow misses it.
+if command -v pyenv > /dev/null; then eval "$(pyenv init - --no-rehash zsh)"; fi
+if command -v pyenv-virtualenv-init > /dev/null; then eval "$(pyenv virtualenv-init - zsh)"; fi
 
 ### SEND_SAFELY ###
 
@@ -294,13 +308,24 @@ alias problem-pods="k get po --all-namespaces | grep -v Running | grep -v Comple
 alias ls="ls --color=auto"
 [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 
-. /opt/homebrew/opt/asdf/libexec/asdf.sh
 source <(lotus completion zsh)
 ### MANAGED BY RANCHER DESKTOP START (DO NOT EDIT)
 export PATH="/Users/patrick.lewis/.rd/bin:$PATH"
 ### MANAGED BY RANCHER DESKTOP END (DO NOT EDIT)
-eval "$(nodenv init -)"
-[[ "$TERM_PROGRAM" == "vscode" ]] && . "$(code --locate-shell-integration-path zsh)"
+eval "$(nodenv init - --no-rehash)"
+
+# `code --locate-shell-integration-path` was the most expensive single fork at
+# 123ms. The path it returns carries no version component, so it survives VS
+# Code updates; the -r guard re-resolves if the app ever moves.
+if [[ "$TERM_PROGRAM" == "vscode" ]]; then
+  _vsc_integration_cache="${XDG_CACHE_HOME:-$HOME/.cache}/vscode-shell-integration-path"
+  if [[ ! -s $_vsc_integration_cache ]] || [[ ! -r "$(<$_vsc_integration_cache)" ]]; then
+    mkdir -p "${_vsc_integration_cache:h}"
+    code --locate-shell-integration-path zsh >| "$_vsc_integration_cache" 2> /dev/null
+  fi
+  [[ -s $_vsc_integration_cache ]] && . "$(<$_vsc_integration_cache)"
+  unset _vsc_integration_cache
+fi
 export PATH="$HOMEBREW_PREFIX/opt/libpq@16/bin:$PATH"
 
 function tf-diff() {
