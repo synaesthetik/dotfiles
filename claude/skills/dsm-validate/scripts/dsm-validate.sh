@@ -5,7 +5,7 @@
 # cleared at once. It never annotates/confirms, restarts, or deletes a migration or
 # its data. For GREEN migrations it prints the confirm-cleanup command for you to run.
 #
-# Two migration shapes are handled, auto-detected per DSM:
+# Three migration shapes are handled, auto-detected per DSM:
 #   * redis  (kubedb -> opstree): rsync + AOF/RDB boot-log logic (see the redis section).
 #   * postgres (kubedb -> cnpg): pg_dump -> PVC -> pg_restore into a CNPG Cluster named after
 #     the datastore. No rsync/boot log; ground truth is the CNPG cluster itself — is it healthy,
@@ -14,6 +14,14 @@
 #     the cluster is healthy and the app db has user tables; YELLOW when the app db is empty
 #     (restore may not have landed); RED when a condition is not True or the cluster is unhealthy.
 #     --deep swaps the reltuples row estimate for exact COUNT(*). --source-check is redis-only.
+#   * elasticsearch (kubedb -> opensearch-operator): rsync of the node's data directory into a
+#     PVC the OpenSearchCluster StatefulSet adopts. Ground truth is that cluster plus the index
+#     list the copied directory produced. Validation is read-only GETs (_cat/indices, _cat/shards)
+#     from inside the node pod. GREEN when the cluster is RUNNING, the pod Ready and user indices
+#     are present; YELLOW when there are no user indices, kubedb-system survived (PostCutover did
+#     not finish), or a yellow health it cannot attribute to the single-node replica effect; RED on
+#     an unassigned primary. --deep adds a per-index _count (reads shards, not cluster state).
+#     Cluster health "yellow" is NOT automatically bad — see the yellow-health trap in SKILL.md.
 #     Only DSMs at phase=AwaitingConfirmation are scored; earlier phases are still in progress.
 #
 # Default mode is READ-ONLY. rsync is trusted normally. The optional --source-check mode is the
@@ -37,12 +45,14 @@
 #   dsm-validate.sh                                  # all namespaces, all types, read-only
 #   dsm-validate.sh idp auditlog                     # only these namespaces
 #   dsm-validate.sh --type=postgres                  # only postgres DSMs (csv: --type=redis,postgres)
+#   dsm-validate.sh --type=elasticsearch             # only elasticsearch DSMs (synonyms: es, opensearch)
 #   dsm-validate.sh --deep greenhouse/foo-kubedb-to-ot   # only this one DSM (ns/name), deep-probed
 #   dsm-validate.sh --scan-source=ns/name,ns2/n2     # source-check ONLY these specific DSMs (redis only)
 #   dsm-validate.sh --source-check                   # source-check EVERY suspicious DSM (redis only)
 #
-# Supported types today: redis, postgres. Others are detected and reported UNSUPPORTED (check by
-# hand) — adding one is an eval_<type>() + a dispatcher arm + a SUPPORTED_TYPES entry.
+# Supported types today: redis, postgres, elasticsearch. Others are detected and reported
+# UNSUPPORTED (check by hand) — adding one is an eval_<type>() + a dispatcher arm + a
+# SUPPORTED_TYPES entry.
 #
 # Default run flags suspicious DSMs (dbsize 0 / rsync mismatch) but does not touch the source.
 # Decide per-DSM whether to escalate, then re-run with --scan-source for the ones you chose.
@@ -64,7 +74,7 @@ nsfilter=()
 # Datastore types with a validator today. New types (memcached, elasticsearch, ...) are the
 # forwards path: add "<type>" here and an eval_<type>() function, and the dispatcher picks it up.
 # A detected type not in this list falls through to eval_unsupported (verdict UNSUPPORTED).
-SUPPORTED_TYPES="redis postgres"
+SUPPORTED_TYPES="redis postgres elasticsearch"
 
 # Normalize a user-supplied type token to the canonical datastore type used throughout.
 norm_type() {
@@ -83,7 +93,7 @@ for a in "$@"; do
     --source-check) SCAN_ALL=true; DEEP=true ;;
     --scan-source=*) IFS=',' read -ra _s <<<"${a#*=}"; scan_set+=("${_s[@]}"); DEEP=true ;;
     --type=*) IFS=',' read -ra _t <<<"${a#*=}"; for _x in "${_t[@]}"; do typefilter+=("$(norm_type "$_x")"); done ;;
-    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,58p' "$0"; exit 0 ;;
     -*) echo "unknown flag: $a" >&2; exit 2 ;;
     *) nsfilter+=("$a") ;;
   esac
@@ -209,8 +219,16 @@ mapfile -t rows < <(kubectl get dsm --all-namespaces -o json | jq -r '
     ),
     (.status.redis.rsyncJobName // ""),
     (.status.redis.sourcePVCName // ""),
-    (.status.postgres.sourcePVCName // "")
-  ] | @tsv')
+    (.status.postgres.sourcePVCName // ""),
+    (.status.elasticsearch.rsyncJobName // ""),
+    (.status.elasticsearch.sourcePVCName // ""),
+    (.status.elasticsearch.targetPVCName // "")
+  ]
+  # NOT @tsv: it joins on TAB, and TAB is IFS whitespace, so read collapses runs of tabs and
+  # every field after an empty column shifts left. A postgres DSM (empty redis columns) or an
+  # elasticsearch one (empty redis AND postgres columns) mis-parses. 0x1f is not whitespace, so
+  # empty columns survive as empty fields.
+  | join("\u001f")')
 
 [ "${#rows[@]}" -eq 0 ] && { echo "No DatastoreMigrations found."; exit 0; }
 
@@ -472,6 +490,196 @@ eval_postgres() {
   echo "RESULT=$verdict"
 }
 
+# eval_elasticsearch <ns> <name> <ds> <phase> <ctrue> <ctot> <rsync> <srcpvc> <tgtpvc>
+# Evaluates one elasticsearch (kubedb -> opensearch-operator) DSM. The migration copies the
+# node's data directory, so the ground truth is the OpenSearchCluster the target operator runs
+# and the index list that copied directory produced. See the elasticsearch section of SKILL.md
+# for the yellow-health trap, which is this type's analogue of redis's 0-keys trap.
+eval_elasticsearch() {
+  local ns="$1" name="$2" ds="$3" phase="$4" ctrue="$5" ctot="$6" rsync="$7" srcpvc="$8" tgtpvc="$9"
+  local verdict="GREEN"; local notes=()
+  local dsname pod rstat rsync_bytes cl clphase health nodes version ready
+  local user pw idx nidx ndocs sysidx kubedb_left sh unassigned_p unassigned_r ism_unassigned
+  local iname icount
+
+  if [ "$ctot" -eq 0 ] || [ "$ctrue" -ne "$ctot" ]; then
+    verdict="RED"; notes+=("conditions ${ctrue}/${ctot} True")
+  fi
+
+  # Every target resource name derives from the datastore name truncated to 48 chars with an fnv
+  # hash suffix, which shell cannot reproduce. targetPVCName already carries the computed result
+  # (data-<dsname>-nodes-0), so read it back out instead of recomputing it.
+  dsname="$ds"
+  if [ -n "$tgtpvc" ]; then
+    dsname="${tgtpvc#data-}"; dsname="${dsname%-nodes-0}"
+  fi
+  pod="${dsname}-nodes-0"
+
+  # rsync job — the data copy. Same shape as redis; "total size is N" is reported as context.
+  # A finished Job is TTL-GC'd well before an operator gets round to confirming, so a missing Job
+  # means "cleaned up", not "failed" — the same reason postgres does not key on its dump/restore
+  # Jobs. Absent the Job, DataSynced/HandoffComplete are the controller's own attestation that the
+  # copy landed, and those already RED-gate above.
+  rstat="?"; rsync_bytes=""
+  if [ -n "$rsync" ]; then
+    if kubectl get job -n "$ns" "$rsync" >/dev/null 2>&1; then
+      rstat=$(kubectl get job -n "$ns" "$rsync" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+      [ "$rstat" = "True" ] || { verdict="RED"; notes+=("rsync job not Complete ($rsync)"); }
+      rsync_bytes=$(kubectl logs -n "$ns" "job/$rsync" 2>/dev/null | grep -oE 'total size is [0-9,]+' | tail -1 | grep -oE '[0-9,]+' | tr -d ',' || true)
+    else
+      rstat="gc"
+      notes+=("rsync job $rsync already GC'd — copy attested by DataSynced/HandoffComplete instead")
+    fi
+  else
+    notes+=("no rsyncJobName in status")
+  fi
+
+  # The OpenSearchCluster CR. MUST be fully qualified: two CRDs claim the kind and the os/
+  # opensearch shortnames (opensearch.org and opensearch.opster.io). datastore-controller writes
+  # the opensearch.org one, so a bare "get opensearchclusters" is ambiguous, not just verbose.
+  cl=$(kubectl get opensearchclusters.opensearch.org "$dsname" -n "$ns" -o json 2>/dev/null || true)
+  if [ -z "$cl" ]; then
+    verdict="RED"; notes+=("OpenSearchCluster $dsname not found in ns $ns (group opensearch.org)")
+    echo "  phase=$phase conditions=${ctrue}/${ctot} rsync=$rstat cluster=MISSING"
+    printf '  VERDICT: %s\n' "$verdict"
+    for n in "${notes[@]}"; do echo "    - $n"; done
+    echo "RESULT=$verdict"; return
+  fi
+  clphase=$(jq -r '.status.phase // "?"' <<<"$cl")
+  health=$(jq -r '.status.health // "unknown"' <<<"$cl")
+  nodes=$(jq -r '.status.availableNodes // 0' <<<"$cl")
+  version=$(jq -r '.status.version // "?"' <<<"$cl")
+
+  [ "$clphase" = "RUNNING" ] || { verdict="RED"; notes+=("OpenSearchCluster phase=$clphase (expected RUNNING)"); }
+  [ "${nodes:-0}" -ge 1 ] 2>/dev/null || { verdict="RED"; notes+=("OpenSearchCluster has ${nodes} available nodes"); }
+
+  ready=$(kubectl get pod -n "$ns" "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  [ "$ready" = "True" ] || { verdict="RED"; notes+=("target pod $pod not Ready"); }
+
+  echo "  phase=$phase conditions=${ctrue}/${ctot} rsync=$rstat rsync_sent=${rsync_bytes:-?}B"
+  echo "  cluster=$dsname phase=$clphase health=$health nodes=$nodes version=$version pod=$([ "$ready" = "True" ] && echo Ready || echo notReady)"
+
+  # cluster health red means unassigned PRIMARIES — missing data, never confirmable. yellow is
+  # deliberately not decided here; the shard probe below separates a structural single-node
+  # yellow from a real one.
+  if [ "$health" = "red" ]; then
+    verdict="RED"; notes+=("cluster health red — unassigned primary shards; data is missing, do not confirm")
+  fi
+
+  # Index probe. Needs the admin credentials the target provider generated; the source password
+  # was carried into this secret during Preflight, so it is the migrated cluster's own password.
+  user=$(kubectl get secret -n "$ns" "${dsname}-admin-credentials" -o jsonpath='{.data.username}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  pw=$(kubectl get secret -n "$ns" "${dsname}-admin-credentials" -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null || true)
+  if [ -z "$pw" ] || [ "$ready" != "True" ]; then
+    [ -z "$pw" ] && notes+=("secret ${dsname}-admin-credentials has no password — index probe skipped")
+    [ "$verdict" = "GREEN" ] && { verdict="YELLOW"; notes+=("could not probe indices; target not verified — do not confirm on an unverified target"); }
+    printf '  VERDICT: %s\n' "$verdict"
+    ((${#notes[@]})) && for n in "${notes[@]}"; do echo "    - $n"; done
+    echo "RESULT=$verdict"; return
+  fi
+
+  idx=$(os_curl "$ns" "$pod" "${user:-admin}" "$pw" "/_cat/indices?format=json")
+  if ! jq -e 'type=="array"' >/dev/null 2>&1 <<<"$idx"; then
+    [ "$verdict" = "GREEN" ] && verdict="YELLOW"
+    notes+=("_cat/indices did not return JSON (auth or endpoint problem) — target not verified")
+    printf '  VERDICT: %s\n' "$verdict"
+    for n in "${notes[@]}"; do echo "    - $n"; done
+    echo "RESULT=$verdict"; return
+  fi
+
+  # User indices exclude dot-prefixed system indices and kubedb-system (the source operator's
+  # own state, which arrives with the data directory and PostCutover deletes).
+  nidx=$(jq '[.[] | select((.index|startswith(".")|not) and .index!="kubedb-system")] | length' <<<"$idx")
+  ndocs=$(jq '[.[] | select((.index|startswith(".")|not) and .index!="kubedb-system") | (."docs.count"//"0"|tonumber)] | add // 0' <<<"$idx")
+  sysidx=$(jq '[.[] | select(.index|startswith("."))] | length' <<<"$idx")
+  kubedb_left=$(jq '[.[] | select(.index=="kubedb-system")] | length' <<<"$idx")
+
+  echo "  indices: ${nidx} user (${ndocs} docs), ${sysidx} system"
+  jq -r '.[] | select((.index|startswith(".")|not) and .index!="kubedb-system")
+         | "    \(.index)  \(."docs.count"//"?") docs  \(."store.size"//"?")  health=\(.health//"?") pri=\(.pri//"?") rep=\(.rep//"?")"' <<<"$idx" | head -15
+  [ "${nidx:-0}" -gt 15 ] 2>/dev/null && echo "    ... ($((nidx-15)) more indices)"
+
+  if [ "${nidx:-0}" -eq 0 ] 2>/dev/null; then
+    [ "$verdict" != "RED" ] && verdict="YELLOW"
+    notes+=("0 user indices on the target — the copied data directory may not have been picked up; do not confirm")
+  fi
+
+  # kubedb-system surviving means PostCutover did not finish. It runs before AwaitingConfirmation
+  # precisely so its result is visible in this window, so its absence is a real signal.
+  if [ "${kubedb_left:-0}" -gt 0 ] 2>/dev/null; then
+    [ "$verdict" != "RED" ] && verdict="YELLOW"
+    notes+=("kubedb-system index still present — PostCutover did not complete; check the <dsm>-post-cutover Job")
+  fi
+
+  # The yellow-health trap. On a single node any index carrying a replica leaves the cluster
+  # yellow forever, which is structural and benign. An unassigned PRIMARY is not.
+  if [ "$health" = "yellow" ] || [ "$health" = "red" ]; then
+    sh=$(os_curl "$ns" "$pod" "${user:-admin}" "$pw" "/_cat/shards?format=json")
+    if jq -e 'type=="array"' >/dev/null 2>&1 <<<"$sh"; then
+      unassigned_p=$(jq '[.[] | select(.state=="UNASSIGNED" and .prirep=="p")] | length' <<<"$sh")
+      unassigned_r=$(jq '[.[] | select(.state=="UNASSIGNED" and .prirep=="r")] | length' <<<"$sh")
+      ism_unassigned=$(jq '[.[] | select(.state=="UNASSIGNED" and .index==".opendistro-ism-config")] | length' <<<"$sh")
+      echo "  unassigned shards: ${unassigned_p} primary, ${unassigned_r} replica"
+      if [ "${unassigned_p:-0}" -gt 0 ] 2>/dev/null; then
+        verdict="RED"
+        notes+=("${unassigned_p} unassigned PRIMARY shard(s) — real missing data, not the single-node replica effect")
+      elif [ "${ism_unassigned:-0}" -gt 0 ] 2>/dev/null; then
+        [ "$verdict" != "RED" ] && verdict="YELLOW"
+        notes+=(".opendistro-ism-config has unassigned shards — PostCutover sets auto_expand_replicas=0-1 to fix exactly this, so it likely did not run; check the <dsm>-post-cutover Job")
+      elif [ "${nodes:-0}" -le 1 ] 2>/dev/null; then
+        notes+=("health yellow from ${unassigned_r} unassigned replica(s) on a ${nodes}-node cluster — structural, not data loss; no primaries unassigned")
+      else
+        [ "$verdict" != "RED" ] && verdict="YELLOW"
+        notes+=("health yellow with ${unassigned_r} unassigned replica(s) on a ${nodes}-node cluster — expected to assign; investigate")
+      fi
+    else
+      notes+=("health=$health but _cat/shards was unreadable; could not tell a single-node replica yellow from a real one")
+    fi
+  fi
+
+  # --deep: ask each user index for a real count. _cat/indices reads cluster-state metadata;
+  # _count actually reads the shards, so it catches an index that is listed but unsearchable.
+  if $DEEP && [ "${nidx:-0}" -gt 0 ] 2>/dev/null; then
+    echo "  deep: per-index _count (reads shards, not cluster state)"
+    while read -r iname; do
+      [ -z "$iname" ] && continue
+      icount=$(os_curl "$ns" "$pod" "${user:-admin}" "$pw" "/${iname}/_count" | jq -r '.count // "ERR"' 2>/dev/null || echo ERR)
+      echo "    ${iname}  ${icount}"
+      if [ "$icount" = "ERR" ]; then
+        [ "$verdict" != "RED" ] && verdict="YELLOW"
+        notes+=("index ${iname} is listed but _count failed — listed in cluster state yet not searchable")
+      fi
+    done < <(jq -r '.[] | select((.index|startswith(".")|not) and .index!="kubedb-system") | .index' <<<"$idx")
+  fi
+
+  if { $SCAN_ALL || in_scanset "$ns/$name"; } && [ -n "$srcpvc" ]; then
+    echo "  note: --source-check/--scan-source is redis-only; validated the target cluster only"
+  fi
+
+  printf '  VERDICT: %s\n' "$verdict"
+  ((${#notes[@]})) && for n in "${notes[@]}"; do echo "    - $n"; done
+  if [ "$verdict" = "GREEN" ]; then
+    echo "    confirm: kubectl annotate DatastoreMigration -n $ns $name datastore.greenhouse.io/migration-confirm-cleanup=true"
+  fi
+  echo "RESULT=$verdict"
+}
+
+# os_curl <ns> <pod> <user> <pw> <path> — GET one OpenSearch API path from inside the node pod.
+# HTTP TLS is on (the operator treats the security plugin as enabled only when it is), so this is
+# https with -k against localhost. The operator names the node container "opensearch"; the retry
+# without -c covers an injected sidecar or a renamed container, so a reachable cluster is never
+# mistaken for an empty one.
+os_curl() {
+  local ns="$1" pod="$2" user="$3" pw="$4" path="$5" out
+  out=$(kubectl exec -n "$ns" "$pod" -c opensearch -- \
+    curl -sS -k -u "$user:$pw" --max-time 15 "https://localhost:9200$path" 2>/dev/null || true)
+  if [ -z "$out" ]; then
+    out=$(kubectl exec -n "$ns" "$pod" -- \
+      curl -sS -k -u "$user:$pw" --max-time 15 "https://localhost:9200$path" 2>/dev/null || true)
+  fi
+  printf '%s' "$out"
+}
+
 # eval_unsupported <ns> <name> <phase> <kind>
 # A DSM whose datastore type has no validator yet. Never GREEN — the operator must check it
 # by hand. This is the graceful landing spot until an eval_<kind>() is added for that type.
@@ -486,16 +694,18 @@ eval_unsupported() {
 # eval_dsm — dispatch to the per-type evaluator based on <kind> (arg 7). To add a type, drop in
 # an eval_<type>() and a case arm here, and list it in SUPPORTED_TYPES.
 # args: <ns> <name> <ds> <phase> <ctrue> <ctot> <kind> <rsync> <redis_srcpvc> <pg_srcpvc>
+#       <es_rsync> <es_srcpvc> <es_tgtpvc>
 eval_dsm() {
   case "$7" in
-    postgres) eval_postgres "$1" "$2" "$3" "$4" "$5" "$6" "${10}" ;;
-    redis)    eval_redis    "$1" "$2" "$3" "$4" "$5" "$6" "$8" "$9" ;;
-    *)        eval_unsupported "$1" "$2" "$4" "$7" ;;
+    postgres)      eval_postgres "$1" "$2" "$3" "$4" "$5" "$6" "${10}" ;;
+    redis)         eval_redis    "$1" "$2" "$3" "$4" "$5" "$6" "$8" "$9" ;;
+    elasticsearch) eval_elasticsearch "$1" "$2" "$3" "$4" "$5" "$6" "${11}" "${12}" "${13}" ;;
+    *)             eval_unsupported "$1" "$2" "$4" "$7" ;;
   esac
 }
 
 for row in "${rows[@]}"; do
-  IFS=$'\t' read -r ns name ds phase ctrue ctot kind rsync redis_srcpvc pg_srcpvc <<<"$row"
+  IFS=$'\x1f' read -r ns name ds phase ctrue ctot kind rsync redis_srcpvc pg_srcpvc es_rsync es_srcpvc es_tgtpvc <<<"$row"
   in_filter "$ns" "$name" || continue
 
   # --type filter: restrict the batch to the requested datastore type(s). Skip others silently.
@@ -524,7 +734,8 @@ for row in "${rows[@]}"; do
   # Fault-isolation: evaluate in a subshell so a fatal error in one DSM (unbound var, an
   # aborted probe) degrades to ERROR for that DSM only — the batch keeps going. stderr still
   # surfaces; a missing RESULT line means the eval aborted.
-  out=$(eval_dsm "$ns" "$name" "$ds" "$phase" "$ctrue" "$ctot" "$kind" "$rsync" "$redis_srcpvc" "$pg_srcpvc" 2>&1) || true
+  out=$(eval_dsm "$ns" "$name" "$ds" "$phase" "$ctrue" "$ctot" "$kind" "$rsync" "$redis_srcpvc" "$pg_srcpvc" \
+        "$es_rsync" "$es_srcpvc" "$es_tgtpvc" 2>&1) || true
   sed '/^RESULT=/d' <<<"$out"
   verdict=$(sed -n 's/^RESULT=//p' <<<"$out" | tail -1)
 

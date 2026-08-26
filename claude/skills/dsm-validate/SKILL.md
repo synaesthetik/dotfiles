@@ -1,22 +1,23 @@
 ---
 name: dsm-validate
-description: Bulk-validate DatastoreMigration CRDs (kubedb Redis -> opstree, and kubedb Postgres -> CNPG) before confirming cleanup. Read-only; classifies each migration GREEN/YELLOW/RED and prints the confirm command for the safe ones. Trigger on "validate migrations", "check the dsms", "are these migrations safe to complete", "verify datastore migrations".
+description: Bulk-validate DatastoreMigration CRDs (kubedb Redis -> opstree, kubedb Postgres -> CNPG, and kubedb Elasticsearch -> opensearch-operator) before confirming cleanup. Read-only; classifies each migration GREEN/YELLOW/RED and prints the confirm command for the safe ones. Trigger on "validate migrations", "check the dsms", "are these migrations safe to complete", "verify datastore migrations".
 ---
 
 # dsm-validate
 
 Validate a batch of `DatastoreMigration` CRDs before you annotate them for cleanup. Confirming a migration is **destructive** — it deletes the source PVC — so this checks each one is genuinely healthy first, then hands you the confirm command only for the ones that pass.
 
-**Two migration shapes, auto-detected per DSM** (discriminator: `spec.targetProvider=="cnpg"` or a `status.postgres` block → postgres; else redis):
+**Three migration shapes, auto-detected per DSM** (discriminator: `spec.targetProvider` or the per-type `status.<type>` block):
 
 - **redis** (`kubedb -> opstree`): rsync + AOF/RDB boot-log logic. This is the original path — everything below about rsync, `DBSIZE`, the boot log, and the 0-keys trap applies to it.
 - **postgres** (`kubedb -> cnpg`): `pg_dump -> PVC -> pg_restore` into a CNPG `Cluster`. Different ground truth — see the **Postgres (kubedb -> cnpg)** section below.
+- **elasticsearch** (`kubedb -> opensearch-operator`): rsync of the node's data directory into a PVC an `OpenSearchCluster` adopts. Ground truth is that cluster plus its index list — see the **Elasticsearch (kubedb -> opensearch-operator)** section below.
 
 Only DSMs at `phase=AwaitingConfirmation` are scored; anything earlier (e.g. `PreflightComplete`) is reported as *in progress* and skipped — it isn't broken, just not ready to confirm.
 
 Read-only by default — it never annotates, restarts, or deletes a migration or its data. The optional `--source-check` mode is the one exception (redis-only): it creates and deletes a short-lived pod that mounts the source PVC `readOnly` (see below).
 
-**Default mode is light-touch:** two `kubectl logs`/`get` reads per DSM (conditions, rsync job, target-pod readiness, and the redis boot log) — no `exec`, no on-disk scan. The whole batch runs in seconds. The precise-but-heavy path — `exec redis-cli DBSIZE` plus a static scan of the on-disk `appendonlydir/*.incr.aof` — is behind `--deep`, for the ambiguous cases light-touch escalates to. `--source-check` and `--scan-source` imply `--deep`.
+**Default mode is light-touch:** a couple of `kubectl logs`/`get` reads per DSM (conditions, rsync job, target readiness) and, for redis, the boot log — no `exec`, no on-disk scan. The whole batch runs in seconds. For **postgres and elasticsearch the default does exec once** to probe the restored data (read-only `psql` SELECTs / `_cat/indices` GETs): there is no log-shaped substitute for "did the data land". The precise-but-heavy redis path — `exec redis-cli DBSIZE` plus a static scan of the on-disk `appendonlydir/*.incr.aof` — is behind `--deep`, for the ambiguous cases light-touch escalates to. `--source-check` and `--scan-source` imply `--deep`.
 
 ## When to use
 
@@ -29,6 +30,7 @@ After running one or more `DatastoreMigration`s that are sitting at `AwaitingCon
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh idp auditlog # only these namespaces
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=postgres        # only postgres DSMs
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=redis,postgres  # csv; either type
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=elasticsearch   # only ES DSMs (aka es, opensearch)
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --deep greenhouse   # deep probe (exec)
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --deep greenhouse/foo-kubedb-to-ot # one DSM only (ns/name)
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --source-check   # deep + source-PVC scan (redis only)
@@ -40,9 +42,11 @@ Requires `kubectl` (pointed at the right cluster/context) and `jq`.
 
 Each DSM is auto-classified by datastore type, and `--type=<csv>` restricts the batch to the type(s) you name (synonyms accepted: `pg`→`postgres`, `ot`/`opstree`→`redis`, `es`/`opensearch`→`elasticsearch`, `memcache`→`memcached`).
 
-**Supported today: `redis`, `postgres`.** Any other detected type (`memcached`, `elasticsearch`, `unknown`, …) is reported `UNSUPPORTED` — flagged for a manual look, never auto-GREEN. Adding a type is the forwards path and is deliberately small: write an `eval_<type>()` in the script, add a `case` arm to the `eval_dsm` dispatcher, and list the type in `SUPPORTED_TYPES`. The classifier prefers explicit signals (`spec.targetProvider`, the per-type `status.<type>` block) and falls back to the datastore name.
+**Supported today: `redis`, `postgres`, `elasticsearch`.** Any other detected type (`memcached`, `unknown`, …) is reported `UNSUPPORTED` — flagged for a manual look, never auto-GREEN. Adding a type is the forwards path and is deliberately small: write an `eval_<type>()` in the script, add a `case` arm to the `eval_dsm` dispatcher, and list the type in `SUPPORTED_TYPES`. The classifier prefers explicit signals (`spec.targetProvider`, the per-type `status.<type>` block) and falls back to the datastore name.
 
-## What it checks per DSM
+## What it checks per DSM (redis)
+
+Postgres and elasticsearch have their own sections below; this one is the redis path.
 
 **Light-touch (default) — all from `kubectl get`/`logs`, no `exec`:**
 
@@ -89,7 +93,7 @@ Ready to accept connections
 
 `nonHC_durable` is a conservative upper bound (a no-TTL key SET then later deleted/overwritten still counts — e.g. the `__redisdump_total_keys` tooling artifact), so it leans toward `YELLOW`/escalation rather than a false `GREEN`. The boot log stays the strongest signal; the durable split is what lets a `DBSIZE=0` resolve under `--deep` without falling back to `--source-check` or a restart.
 
-## RED from a not-Ready pod + a multi-GB transfer — two causes, disambiguate FIRST
+## RED from a not-Ready pod + a multi-GB transfer — two causes, disambiguate FIRST (redis)
 
 A `notReady`/crashlooping target with a multi-GB rsync has **two distinct causes with opposite fixes**. Do not assume the AOF-replay crashloop — **read `lastState.terminated` before deciding**:
 
@@ -165,11 +169,86 @@ Everything above (rsync, `DBSIZE`, boot log, the 0-keys trap, `--source-check`) 
 - **YELLOW** — cluster healthy but the app db has 0 user tables, or no application db exists (restore may not have loaded). Investigate before confirming — cleanup deletes the source PVC.
 - **RED** — a condition is not `True`, or the CNPG cluster is missing / not healthy.
 
+## Elasticsearch (kubedb -> opensearch-operator)
+
+Everything in the redis sections (rsync, `DBSIZE`, boot log, the 0-keys trap, `--source-check`) is **redis-only**. Elasticsearch is a third shape, with the same CLI, flags, and GREEN/YELLOW/RED verdicts.
+
+**The migration** is a hard-downtime PVC handoff. Preflight copies the source admin password into the target's `<name>-admin-credentials` Secret, pre-creates the target PVC (`data-<name>-nodes-0`), and pins the source PV to `Retain`. StopOldInstance halts the KubeDB CR. SyncData rsyncs the data directory. Handoff deletes the two colliding cert Secrets and flips the backend annotation. **PostCutover** then drops the `kubedb-system` index and sets `auto_expand_replicas: 0-1` on `.opendistro-ism-config` — it deliberately runs *before* `AwaitingConfirmation`, so what you inspect in this window is the finished state. Cleanup (on confirm) deletes the KubeDB CR, the source PVC, the orphaned credential Secrets, and restores the PV reclaim policy.
+
+Only the data directory moves, so the target inherits the source's security index — that is why the password is carried over rather than regenerated, and why the probe reads `<name>-admin-credentials`.
+
+**Ground truth is the `OpenSearchCluster` plus its index list**, not the rsync job.
+
+**What it checks per DSM (light-touch default):**
+
+1. All `status.conditions` are `True` (the same five).
+2. The rsync `Job` reached `Complete`; its `total size is N` is reported as context. **A missing Job is not a failure** — a finished Job is TTL-GC'd long before an operator gets round to confirming, so an absent one is reported `rsync=gc` and the copy is attested by `DataSynced`/`HandoffComplete` instead (the same reason postgres does not key on its dump/restore Jobs). Only a Job that exists and is *not* `Complete` scores `RED`.
+3. The `OpenSearchCluster` is `status.phase == RUNNING` with `availableNodes >= 1`. Missing or not RUNNING → `RED`.
+4. The target pod `<name>-nodes-0` is `Ready` → else `RED` (and the index probe is skipped, so the verdict is never a false GREEN).
+5. **Index probe** (read-only `_cat/indices` from inside the node pod, over https with the admin credentials): counts **user** indices — excluding dot-prefixed system indices and `kubedb-system` — and their doc totals. 0 user indices → `YELLOW`.
+6. `kubedb-system` still present → `YELLOW`. PostCutover runs before this window, so its survival means that Job did not finish.
+7. Health `yellow`/`red` → one `_cat/shards` read to tell a structural yellow from a real one (below).
+
+**`--deep`:** a per-index `_count`. `_cat/indices` reads cluster-state metadata; `_count` actually reads the shards, so it catches an index that is listed but unsearchable.
+
+### The yellow-health trap (elasticsearch's analogue of the 0-keys trap)
+
+`cluster health == yellow` is **not** automatically a failed migration.
+
+These datastores run single-node. Any index carrying `rep >= 1` can never assign its replica on one node, so the cluster sits yellow permanently — structural, not data loss. `.opendistro-ism-config` is the one that bites: the ISM plugin creates it with a **fixed one replica**, which is exactly what PostCutover's `auto_expand_replicas: 0-1` exists to fix.
+
+So the shard probe decides, not the health colour:
+
+- unassigned **primary** → `RED`. Genuinely missing data.
+- unassigned **replicas only** on a single node → `GREEN`, with a note saying why. Expected.
+- `.opendistro-ism-config` unassigned → `YELLOW`. PostCutover is what fixes this, so it likely did not run — check the `<dsm>-post-cutover` Job.
+- unassigned replicas on a **multi-node** cluster → `YELLOW`. Those should have assigned.
+
+### Gotcha: `OpenSearchCluster` is an ambiguous kind
+
+Two CRDs claim the kind *and* the `os`/`opensearch` shortnames:
+
+```
+opensearchclusters.opensearch.org        <- datastore-controller writes this one
+opensearchclusters.opensearch.opster.io
+```
+
+A bare `kubectl get opensearchclusters` is **ambiguous, not merely verbose** — it can resolve to the wrong group and report "not found" for a cluster that exists. Always fully qualify `opensearchclusters.opensearch.org`.
+
+### What this cannot check: a pre-migration baseline
+
+The skill sees only the post-migration cluster, so it can tell you the indices are *present and searchable* but not that they are *complete*. For a migration you care about, capture a baseline before you start and diff it after:
+
+```bash
+# before (source pod, kubedb naming)
+PW=$(kubectl get secret -n <ns> <name>-auth -o jsonpath='{.data.password}' | base64 -d)
+kubectl exec -n <ns> <name>-0 -- \
+  curl -sk -u "admin:$PW" 'https://localhost:9200/_cat/indices?v&s=index' > /tmp/es-before.txt
+
+# after (target pod, operator naming + the new credentials secret)
+PW=$(kubectl get secret -n <ns> <name>-admin-credentials -o jsonpath='{.data.password}' | base64 -d)
+kubectl exec -n <ns> <name>-nodes-0 -- \
+  curl -sk -u "admin:$PW" 'https://localhost:9200/_cat/indices?v&s=index' > /tmp/es-after.txt
+
+diff /tmp/es-before.txt /tmp/es-after.txt
+```
+
+`kubedb-system` disappearing is expected — PostCutover drops it.
+
+**Verdicts for elasticsearch:**
+- **GREEN** — conditions all `True`, cluster `RUNNING`, pod `Ready`, at least one user index present. A single-node replica yellow is noted, not penalized.
+- **YELLOW** — 0 user indices, `kubedb-system` survived, a yellow health it cannot attribute to the single-node replica effect, or the probe could not run (missing credentials, unreadable endpoint). An unverified target is never GREEN.
+- **RED** — a condition not `True`, an rsync Job that exists but is not `Complete` (a GC'd Job is not a failure — see above), the `OpenSearchCluster` missing or not `RUNNING`, the pod not `Ready`, or an unassigned primary shard.
+
+`--source-check` / `--scan-source` are **not implemented** for elasticsearch (they would need to boot opensearch against the source PVC); a targeted DSM prints a note and validates the target only.
+
+**Rollback stays open until you confirm.** Handoff halts the KubeDB CR rather than deleting it, and only removes the regenerable `-admin-cert` / `-transport-cert` Secrets. Cleanup is what deletes the source — the controller's own `AwaitingConfirmation` message says so ("deleting it ends the unhalt rollback path"). So a YELLOW here is recoverable; a YELLOW you confirmed anyway is not.
+
 ## Verdicts
 
 - **GREEN** — safe to confirm. The script prints the exact annotate command; run it yourself.
 - **YELLOW** — needs a human. Investigate (restart + re-check, or diff against the source PVC) before confirming.
-- **RED** — broken (a condition not True; for redis: rsync incomplete or pod not Ready; for postgres: CNPG cluster missing/unhealthy). Do not confirm.
+- **RED** — broken (a condition not True; for redis: rsync incomplete or pod not Ready; for postgres: CNPG cluster missing/unhealthy; for elasticsearch: OpenSearchCluster missing/not RUNNING, pod not Ready, or an unassigned primary shard). Do not confirm.
 
 ## Confirming (you run this, not the skill)
 
@@ -177,7 +256,10 @@ Everything above (rsync, `DBSIZE`, boot log, the 0-keys trap, `--source-check`) 
 kubectl annotate DatastoreMigration -n <ns> <name> datastore.greenhouse.io/migration-confirm-cleanup=true
 ```
 
-## Deeper manual check for a YELLOW / suspicious 0
+## Deeper manual check for a YELLOW / suspicious 0 (redis)
+
+Redis-only — the commands below assume an AOF/RDB on-disk layout. For an elasticsearch YELLOW see
+the baseline-diff and PostCutover checks in its own section; for postgres, probe the CNPG primary.
 
 Back up first (the source PVC gets deleted on confirm):
 
