@@ -256,6 +256,53 @@ diff /tmp/es-before.txt /tmp/es-after.txt
 kubectl annotate DatastoreMigration -n <ns> <name> datastore.greenhouse.io/migration-confirm-cleanup=true
 ```
 
+### Orphaned DSMs — do NOT confirm these
+
+A DSM whose `datastoreRef` no longer resolves. Short-lived envs (PR envs especially) get torn
+down while their migration sits at `AwaitingConfirmation`, taking the `Datastore` with them.
+They look confirmable and are not. Find them before a bulk confirm:
+
+```bash
+live=$(kubectl get datastores.datastore.greenhouse.io -n <ns> -o json | jq -r '.items[].metadata.name')
+kubectl get datastoremigration -n <ns> -o json \
+  | jq -r '.items[] | "\(.spec.datastoreRef.name)\t\(.metadata.name)"' \
+  | while IFS=$'\t' read -r ref dsm; do grep -qx "$ref" <<<"$live" || echo "orphan: $dsm"; done
+```
+
+Three approaches that do **not** work, in the order people try them:
+
+1. **Confirming it.** Cleanup resolves the `Datastore` first and dies on
+   `getting Datastore ...: not found`, moving the DSM to `Failed` without touching storage.
+   `Failed` is terminal — the controller will not retry out of it — and the annotation is spent.
+2. **Deleting the DSM first.** The source PVC carries no ownerReference (its owner was the
+   KubeDB CR, already deleted), so nothing cascades. The finalizer releases cleanly and the PVC
+   survives with nothing referencing it — findable only by diffing PVCs against live Datastores.
+3. **Deleting the PVC while the PV is still `Retain`.** Preflight pinned it there and Cleanup is
+   what restores `Delete`, so with Cleanup unable to run the PV drops to `Released` and the
+   backing cloud volume stays live. Recoverable *only while the PV object exists*: patch it to
+   `Delete` and the PV controller reclaims the volume. Delete the PV too and the volume is
+   reachable only from the cloud console.
+
+The one order that works — flip before the PVC goes, or the cascade never reaches the volume:
+
+```bash
+pv=$(kubectl get pvc -n <ns> "data-<ds>-0" -o jsonpath='{.spec.volumeName}')
+kubectl patch pv "$pv" -p '{"spec":{"persistentVolumeReclaimPolicy":"Delete"}}'
+kubectl delete pvc -n <ns> "data-<ds>-0"
+kubectl delete datastoremigration -n <ns> "<ds>-kubedb-to-<target>"
+```
+
+Sweep for damage from earlier attempts — `Released` PVs are stranded volumes, and a source PVC
+with no live Datastore and no DSM is a stray from a DSM-first delete:
+
+```bash
+kubectl get pv -o json | jq -r '.items[] | select(.status.phase=="Released")
+  | "\(.metadata.name)\t\(.spec.persistentVolumeReclaimPolicy)\t\(.spec.csi.volumeHandle)"'
+```
+
+Record the `volumeHandle`s before deleting anything: once the PV objects are gone, that id is the
+only remaining handle on the volume.
+
 ## Deeper manual check for a YELLOW / suspicious 0 (redis)
 
 Redis-only — the commands below assume an AOF/RDB on-disk layout. For an elasticsearch YELLOW see
