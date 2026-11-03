@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dsm-validate.sh — bulk validator for DatastoreMigration (kubedb -> cnpg/ot).
+# dsm-validate.sh — bulk validator for DatastoreMigration (kubedb -> cnpg/ot/opensearch/mck).
 #
 # Classifies every DSM into GREEN / YELLOW / RED so a batch of migrations can be
 # cleared at once. It never annotates/confirms, restarts, or deletes a migration or
@@ -50,7 +50,7 @@
 #   dsm-validate.sh --scan-source=ns/name,ns2/n2     # source-check ONLY these specific DSMs (redis only)
 #   dsm-validate.sh --source-check                   # source-check EVERY suspicious DSM (redis only)
 #
-# Supported types today: redis, postgres, elasticsearch. Others are detected and reported
+# Supported types today: redis, postgres, elasticsearch, mongodb (see SKILL.md). Others are detected and reported
 # UNSUPPORTED (check by hand) — adding one is an eval_<type>() + a dispatcher arm + a
 # SUPPORTED_TYPES entry.
 #
@@ -74,7 +74,7 @@ nsfilter=()
 # Datastore types with a validator today. New types (memcached, elasticsearch, ...) are the
 # forwards path: add "<type>" here and an eval_<type>() function, and the dispatcher picks it up.
 # A detected type not in this list falls through to eval_unsupported (verdict UNSUPPORTED).
-SUPPORTED_TYPES="redis postgres elasticsearch"
+SUPPORTED_TYPES="redis postgres elasticsearch mongodb"
 
 # Normalize a user-supplied type token to the canonical datastore type used throughout.
 norm_type() {
@@ -83,6 +83,7 @@ norm_type() {
     redis|ot|opstree)                    echo redis ;;
     memcache|memcached)                  echo memcached ;;
     es|elastic|elasticsearch|opensearch) echo elasticsearch ;;
+    mongo|mongodb|mck)                   echo mongodb ;;
     *)                                   echo "$1" ;;
   esac
 }
@@ -209,11 +210,13 @@ mapfile -t rows < <(kubectl get dsm --all-namespaces -o json | jq -r '
       elif (.status.redis!=null) then "redis"
       elif (.status.memcached!=null) then "memcached"
       elif (.status.elasticsearch!=null) then "elasticsearch"
+      elif (.spec.targetProvider=="mck") or (.status.mongodb!=null) then "mongodb"
       else ((.spec.datastoreRef.name // .metadata.name // "") |
         if   test("postgres|cnpg|-pg-") then "postgres"
         elif test("redis")              then "redis"
         elif test("memcache")           then "memcached"
         elif test("elastic|opensearch") then "elasticsearch"
+        elif test("mongo")              then "mongodb"
         else "unknown" end)
       end
     ),
@@ -222,7 +225,9 @@ mapfile -t rows < <(kubectl get dsm --all-namespaces -o json | jq -r '
     (.status.postgres.sourcePVCName // ""),
     (.status.elasticsearch.rsyncJobName // ""),
     (.status.elasticsearch.sourcePVCName // ""),
-    (.status.elasticsearch.targetPVCName // "")
+    (.status.elasticsearch.targetPVCName // ""),
+    (.status.mongodb.restoreJobName // ""),
+    (.status.mongodb.sourceCRName // "")
   ]
   # NOT @tsv: it joins on TAB, and TAB is IFS whitespace, so read collapses runs of tabs and
   # every field after an empty column shifts left. A postgres DSM (empty redis columns) or an
@@ -681,6 +686,101 @@ os_curl() {
 }
 
 # eval_unsupported <ns> <name> <phase> <kind>
+# eval_mongodb <ns> <name> <ds> <phase> <ctrue> <ctot> <restorejob> <sourcecr>
+# Evaluates one mongodb (kubedb -> MCK MongoDBCommunity) DSM. The migration is mongodump ->
+# dump PVC -> mongorestore into a 1-member MongoDBCommunity. The restore Job itself compares
+# per-collection counts against the dump and exits non-zero on any MISSING/MISMATCH, so a Job
+# log with "COUNTS OK" is the strongest signal. That Job is TTL-deleted 1h after it finishes,
+# taking the log with it; a missing Job is reported restore=gc and DataSynced attests the counts.
+# Ground truth beyond that is the MCK replica set and a read-only count of its collections.
+# The halted KubeDB source must still exist: it is the rollback path until Cleanup.
+eval_mongodb() {
+  local ns="$1" name="$2" ds="$3" phase="$4" ctrue="$5" ctot="$6" rjob="$7" srccr="$8"
+  local verdict="GREEN"; local notes=()
+  local cr dsj mck mckphase podready job jdone jfail jlog restore src halted counts ncoll ndocs authowners
+  local js="db.adminCommand({listDatabases: 1, nameOnly: true}).databases.map(d => d.name).filter(n => n !== 'config' && n !== 'local').sort().forEach(n => { const d = db.getSiblingDB(n); d.getCollectionInfos({type: 'collection'}).map(c => c.name).filter(c => !c.startsWith('system.')).sort().forEach(c => print(n + '\t' + c + '\t' + d.getCollection(c).countDocuments({}))); })"
+
+  if [ "$ctot" -eq 0 ] || [ "$ctrue" -ne "$ctot" ]; then
+    verdict="RED"; notes+=("conditions ${ctrue}/${ctot} True")
+  fi
+
+  # The MongoDBCommunity name is recorded on the Datastore (DSC truncates long names).
+  dsj=$(kubectl get datastores.datastore.greenhouse.io "$ds" -n "$ns" -o json 2>/dev/null || true)
+  [ -n "$dsj" ] && cr=$(jq -r '.status.k8sMongoDB.mongoDBCommunityName // empty' <<<"$dsj" 2>/dev/null || true)
+  cr=${cr:-$ds}
+
+  mck=$(kubectl get mongodbcommunity.mongodbcommunity.mongodb.com "$cr" -n "$ns" -o json 2>/dev/null || true)
+  if [ -z "$mck" ]; then
+    verdict="RED"; mckphase="MISSING"; notes+=("MongoDBCommunity $cr not found in ns $ns")
+  else
+    mckphase=$(jq -r '.status.phase // "?"' <<<"$mck")
+    [ "$mckphase" = "Running" ] || { verdict="RED"; notes+=("MongoDBCommunity $cr phase=$mckphase, not Running"); }
+  fi
+  podready=$(kubectl get pod "$cr-0" -n "$ns" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)
+  [ "$podready" = "True" ] || { verdict="RED"; notes+=("pod $cr-0 not Ready"); }
+
+  # Restore Job: COUNTS OK in its log, or TTL-GC'd (DataSynced then attests the count check).
+  restore="none"
+  if [ -n "$rjob" ]; then
+    job=$(kubectl get job "$rjob" -n "$ns" -o json 2>/dev/null || true)
+    if [ -z "$job" ]; then
+      restore="gc"
+    else
+      jdone=$(jq -r '.status.succeeded // 0' <<<"$job"); jfail=$(jq -r '.status.failed // 0' <<<"$job")
+      if [ "${jdone:-0}" -ge 1 ] 2>/dev/null; then
+        jlog=$(kubectl logs -n "$ns" "job/$rjob" --tail=200 2>/dev/null || true)
+        if grep -q '^COUNTS OK' <<<"$jlog"; then restore="counts-ok"
+        else restore="complete-no-log"; notes+=("restore Job Complete but no COUNTS OK line in its log"); [ "$verdict" != "RED" ] && verdict="YELLOW"; fi
+      else
+        restore="not-complete"; verdict="RED"; notes+=("restore Job $rjob not Complete (failed=${jfail})")
+      fi
+    fi
+  fi
+
+  # Halted KubeDB source: the unhalt rollback path. Gone or running before Cleanup is wrong.
+  src="?"
+  if [ -n "$srccr" ]; then
+    halted=$(kubectl get mongodbs.kubedb.com "$srccr" -n "$ns" -o jsonpath='{.spec.halted}' 2>/dev/null) && src="halted=${halted:-false}" || src="MISSING"
+    if [ "$src" = "MISSING" ]; then verdict="RED"; notes+=("KubeDB source $srccr is gone before Cleanup; rollback path lost")
+    elif [ "$halted" != "true" ]; then verdict="RED"; notes+=("KubeDB source $srccr is not halted")
+    fi
+    authowners=$(kubectl get secret "$srccr-auth" -n "$ns" -o jsonpath='{.metadata.ownerReferences}' 2>/dev/null || echo "absent")
+    [ -z "$authowners" ] && notes+=("info: $srccr-auth is unowned (halt strips the KubeDB owner); Cleanup deletes it from DSC 76994543, else the sweep flags it")
+  fi
+
+  echo "  phase=$phase conditions=${ctrue}/${ctot} mck=$mckphase pod=${podready:-?} restore=$restore source=$src"
+
+  # Data probe: read-only countDocuments over every non-system collection, as the admin app user.
+  if [ "$podready" = "True" ]; then
+    counts=$(kubectl get secret "$cr-admin-app" -n "$ns" -o jsonpath='{.data.connectionString\.standard}' 2>/dev/null | base64 -d 2>/dev/null \
+      | kubectl exec -i -n "$ns" "$cr-0" -c mongod -- sh -c 'read -r U; exec mongosh "$U" --quiet --eval "$1"' sh "$js" 2>/dev/null | tr -d '\r' || true)
+    if [ -z "$counts" ]; then
+      [ "$verdict" != "RED" ] && verdict="YELLOW"; notes+=("count probe returned nothing (secret $cr-admin-app or mongosh unreachable); target unverified")
+    else
+      ncoll=$(awk -F'\t' '$1!="kubedb-system"' <<<"$counts" | grep -c . || true)
+      ndocs=$(awk -F'\t' '$1!="kubedb-system"{s+=$3} END{print s+0}' <<<"$counts")
+      echo "  collections: ${ncoll} user, ${ndocs} docs"
+      awk -F'\t' '{printf "    %s.%s  %s\n", $1, $2, $3}' <<<"$counts" | head -15
+      [ "$(grep -c . <<<"$counts")" -gt 15 ] && echo "    ... ($(( $(grep -c . <<<"$counts") - 15 )) more)"
+      if [ "${ncoll:-0}" -eq 0 ]; then
+        [ "$verdict" != "RED" ] && verdict="YELLOW"; notes+=("no user collections on MCK; restore may not have landed")
+      fi
+    fi
+  fi
+  [ "$restore" = "gc" ] && notes+=("restore Job TTL-deleted; COUNTS OK attested by DataSynced (the restore exits non-zero on a count mismatch)")
+
+  if { $SCAN_ALL || in_scanset "$ns/$name"; }; then
+    echo "  note: --source-check/--scan-source is redis-only; validated the MCK target only"
+  fi
+
+  printf '  VERDICT: %s\n' "$verdict"
+  ((${#notes[@]})) && for n in "${notes[@]}"; do echo "    - $n"; done
+  if [ "$verdict" = "GREEN" ]; then
+    echo "    confirm: kubectl annotate DatastoreMigration -n $ns $name datastore.greenhouse.io/migration-confirm-cleanup=true"
+  fi
+  echo "RESULT=$verdict"
+}
+
 # A DSM whose datastore type has no validator yet. Never GREEN — the operator must check it
 # by hand. This is the graceful landing spot until an eval_<kind>() is added for that type.
 eval_unsupported() {
@@ -694,18 +794,19 @@ eval_unsupported() {
 # eval_dsm — dispatch to the per-type evaluator based on <kind> (arg 7). To add a type, drop in
 # an eval_<type>() and a case arm here, and list it in SUPPORTED_TYPES.
 # args: <ns> <name> <ds> <phase> <ctrue> <ctot> <kind> <rsync> <redis_srcpvc> <pg_srcpvc>
-#       <es_rsync> <es_srcpvc> <es_tgtpvc>
+#       <es_rsync> <es_srcpvc> <es_tgtpvc> <mongo_restorejob> <mongo_srccr>
 eval_dsm() {
   case "$7" in
     postgres)      eval_postgres "$1" "$2" "$3" "$4" "$5" "$6" "${10}" ;;
     redis)         eval_redis    "$1" "$2" "$3" "$4" "$5" "$6" "$8" "$9" ;;
     elasticsearch) eval_elasticsearch "$1" "$2" "$3" "$4" "$5" "$6" "${11}" "${12}" "${13}" ;;
+    mongodb)       eval_mongodb  "$1" "$2" "$3" "$4" "$5" "$6" "${14}" "${15}" ;;
     *)             eval_unsupported "$1" "$2" "$4" "$7" ;;
   esac
 }
 
 for row in "${rows[@]}"; do
-  IFS=$'\x1f' read -r ns name ds phase ctrue ctot kind rsync redis_srcpvc pg_srcpvc es_rsync es_srcpvc es_tgtpvc <<<"$row"
+  IFS=$'\x1f' read -r ns name ds phase ctrue ctot kind rsync redis_srcpvc pg_srcpvc es_rsync es_srcpvc es_tgtpvc mongo_rjob mongo_srccr <<<"$row"
   in_filter "$ns" "$name" || continue
 
   # --type filter: restrict the batch to the requested datastore type(s). Skip others silently.
@@ -735,7 +836,7 @@ for row in "${rows[@]}"; do
   # aborted probe) degrades to ERROR for that DSM only — the batch keeps going. stderr still
   # surfaces; a missing RESULT line means the eval aborted.
   out=$(eval_dsm "$ns" "$name" "$ds" "$phase" "$ctrue" "$ctot" "$kind" "$rsync" "$redis_srcpvc" "$pg_srcpvc" \
-        "$es_rsync" "$es_srcpvc" "$es_tgtpvc" 2>&1) || true
+        "$es_rsync" "$es_srcpvc" "$es_tgtpvc" "$mongo_rjob" "$mongo_srccr" 2>&1) || true
   sed '/^RESULT=/d' <<<"$out"
   verdict=$(sed -n 's/^RESULT=//p' <<<"$out" | tail -1)
 

@@ -1,23 +1,24 @@
 ---
 name: dsm-validate
-description: Bulk-validate DatastoreMigration CRDs (kubedb Redis -> opstree, kubedb Postgres -> CNPG, and kubedb Elasticsearch -> opensearch-operator) before confirming cleanup. Read-only; classifies each migration GREEN/YELLOW/RED and prints the confirm command for the safe ones. Trigger on "validate migrations", "check the dsms", "are these migrations safe to complete", "verify datastore migrations".
+description: Bulk-validate DatastoreMigration CRDs (kubedb Redis -> opstree, kubedb Postgres -> CNPG, kubedb Elasticsearch -> opensearch-operator, and kubedb MongoDB -> MCK) before confirming cleanup. Read-only; classifies each migration GREEN/YELLOW/RED and prints the confirm command for the safe ones. Trigger on "validate migrations", "check the dsms", "are these migrations safe to complete", "verify datastore migrations".
 ---
 
 # dsm-validate
 
 Validate a batch of `DatastoreMigration` CRDs before you annotate them for cleanup. Confirming a migration is **destructive** — it deletes the source PVC — so this checks each one is genuinely healthy first, then hands you the confirm command only for the ones that pass.
 
-**Three migration shapes, auto-detected per DSM** (discriminator: `spec.targetProvider` or the per-type `status.<type>` block):
+**Four migration shapes, auto-detected per DSM** (discriminator: `spec.targetProvider` or the per-type `status.<type>` block):
 
 - **redis** (`kubedb -> opstree`): rsync + AOF/RDB boot-log logic. This is the original path — everything below about rsync, `DBSIZE`, the boot log, and the 0-keys trap applies to it.
 - **postgres** (`kubedb -> cnpg`): `pg_dump -> PVC -> pg_restore` into a CNPG `Cluster`. Different ground truth — see the **Postgres (kubedb -> cnpg)** section below.
 - **elasticsearch** (`kubedb -> opensearch-operator`): rsync of the node's data directory into a PVC an `OpenSearchCluster` adopts. Ground truth is that cluster plus its index list — see the **Elasticsearch (kubedb -> opensearch-operator)** section below.
+- **mongodb** (`kubedb -> mck`): `mongodump -> PVC -> mongorestore` into a 1-member `MongoDBCommunity`. Ground truth is the restore Job's own count check plus a read-only count on MCK — see the **MongoDB (kubedb -> MCK)** section below.
 
 Only DSMs at `phase=AwaitingConfirmation` are scored; anything earlier (e.g. `PreflightComplete`) is reported as *in progress* and skipped — it isn't broken, just not ready to confirm.
 
 Read-only by default — it never annotates, restarts, or deletes a migration or its data. The optional `--source-check` mode is the one exception (redis-only): it creates and deletes a short-lived pod that mounts the source PVC `readOnly` (see below).
 
-**Default mode is light-touch:** a couple of `kubectl logs`/`get` reads per DSM (conditions, rsync job, target readiness) and, for redis, the boot log — no `exec`, no on-disk scan. The whole batch runs in seconds. For **postgres and elasticsearch the default does exec once** to probe the restored data (read-only `psql` SELECTs / `_cat/indices` GETs): there is no log-shaped substitute for "did the data land". The precise-but-heavy redis path — `exec redis-cli DBSIZE` plus a static scan of the on-disk `appendonlydir/*.incr.aof` — is behind `--deep`, for the ambiguous cases light-touch escalates to. `--source-check` and `--scan-source` imply `--deep`.
+**Default mode is light-touch:** a couple of `kubectl logs`/`get` reads per DSM (conditions, rsync job, target readiness) and, for redis, the boot log — no `exec`, no on-disk scan. The whole batch runs in seconds. For **postgres, elasticsearch and mongodb the default does exec once** to probe the restored data (read-only `psql` SELECTs / `_cat/indices` GETs): there is no log-shaped substitute for "did the data land". The precise-but-heavy redis path — `exec redis-cli DBSIZE` plus a static scan of the on-disk `appendonlydir/*.incr.aof` — is behind `--deep`, for the ambiguous cases light-touch escalates to. `--source-check` and `--scan-source` imply `--deep`.
 
 ## When to use
 
@@ -31,6 +32,7 @@ After running one or more `DatastoreMigration`s that are sitting at `AwaitingCon
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=postgres        # only postgres DSMs
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=redis,postgres  # csv; either type
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=elasticsearch   # only ES DSMs (aka es, opensearch)
+~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --type=mongodb         # only MongoDB DSMs (aka mongo, mck)
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --deep greenhouse   # deep probe (exec)
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --deep greenhouse/foo-kubedb-to-ot # one DSM only (ns/name)
 ~/.claude/skills/dsm-validate/scripts/dsm-validate.sh --source-check   # deep + source-PVC scan (redis only)
@@ -40,9 +42,9 @@ Requires `kubectl` (pointed at the right cluster/context) and `jq`.
 
 ### Datastore types
 
-Each DSM is auto-classified by datastore type, and `--type=<csv>` restricts the batch to the type(s) you name (synonyms accepted: `pg`→`postgres`, `ot`/`opstree`→`redis`, `es`/`opensearch`→`elasticsearch`, `memcache`→`memcached`).
+Each DSM is auto-classified by datastore type, and `--type=<csv>` restricts the batch to the type(s) you name (synonyms accepted: `pg`→`postgres`, `ot`/`opstree`→`redis`, `es`/`opensearch`→`elasticsearch`, `mongo`/`mck`→`mongodb`, `memcache`→`memcached`).
 
-**Supported today: `redis`, `postgres`, `elasticsearch`.** Any other detected type (`memcached`, `unknown`, …) is reported `UNSUPPORTED` — flagged for a manual look, never auto-GREEN. Adding a type is the forwards path and is deliberately small: write an `eval_<type>()` in the script, add a `case` arm to the `eval_dsm` dispatcher, and list the type in `SUPPORTED_TYPES`. The classifier prefers explicit signals (`spec.targetProvider`, the per-type `status.<type>` block) and falls back to the datastore name.
+**Supported today: `redis`, `postgres`, `elasticsearch`, `mongodb`.** Any other detected type (`memcached`, `unknown`, …) is reported `UNSUPPORTED` — flagged for a manual look, never auto-GREEN. Adding a type is the forwards path and is deliberately small: write an `eval_<type>()` in the script, add a `case` arm to the `eval_dsm` dispatcher, and list the type in `SUPPORTED_TYPES`. The classifier prefers explicit signals (`spec.targetProvider`, the per-type `status.<type>` block) and falls back to the datastore name.
 
 ## What it checks per DSM (redis)
 
@@ -244,11 +246,35 @@ diff /tmp/es-before.txt /tmp/es-after.txt
 
 **Rollback stays open until you confirm.** Handoff halts the KubeDB CR rather than deleting it, and only removes the regenerable `-admin-cert` / `-transport-cert` Secrets. Cleanup is what deletes the source — the controller's own `AwaitingConfirmation` message says so ("deleting it ends the unhalt rollback path"). So a YELLOW here is recoverable; a YELLOW you confirmed anyway is not.
 
+## MongoDB (kubedb -> MCK)
+
+The redis sections (rsync, `DBSIZE`, boot log, `--source-check`) do not apply. Same CLI, flags and verdicts.
+
+**The migration:** Preflight snapshots `<n>-auth` and runs `mongodump` (counts before and after the dump into the dump PVC). StopOldInstance halts the KubeDB CR (`spec.halted=true`). SyncData creates the `MongoDBCommunity` and runs `mongorestore`, which then counts every collection on MCK and **exits non-zero on any `MISSING`/`MISMATCH`**, printing `COUNTS OK N collections` on success. Handoff flips the Datastore to `mck`. The halted KubeDB CR stays until Cleanup — it is the unhalt rollback path.
+
+**What it checks per DSM (light-touch default):**
+
+1. All `status.conditions` are `True`.
+2. The `MongoDBCommunity` (name from the Datastore's `status.k8sMongoDB.mongoDBCommunityName`) is `Running`, and pod `<cr>-0` is `Ready`. Else `RED`.
+3. The restore Job (`status.mongodb.restoreJobName`): `Complete` with `COUNTS OK` in its log is the strongest signal. **A missing Job is not a failure**: it is TTL-deleted 1 h after it finishes, taking the log with it, so it is reported `restore=gc` and `DataSynced` attests the count check. A Job that exists and is not `Complete` → `RED`; `Complete` with no `COUNTS OK` line → `YELLOW`.
+4. The KubeDB source (`status.mongodb.sourceCRName`) still exists with `spec.halted=true`. Gone or not halted before Cleanup → `RED`.
+5. **Count probe** (read-only `countDocuments` per collection, via `mongosh` in the `mongod` container with the `<cr>-admin-app` connection string): prints every collection with its count. 0 user collections (excluding `kubedb-system`) → `YELLOW`; probe returns nothing → `YELLOW`.
+6. Info only: `<source>-auth` unowned. Halting strips KubeDB's ownerReference, so WipeOut never deletes it; DSC Cleanup deletes it from `76994543`. Older builds leave it for the sweep.
+
+`--deep` adds nothing for mongodb (the default count is already exact). `--source-check` / `--scan-source` are not implemented.
+
+**Verdicts for mongodb:**
+- **GREEN** — conditions all `True`, MCK `Running`, pod `Ready`, source halted, restore `COUNTS OK` or GC'd, ≥1 user collection.
+- **YELLOW** — no user collections, the count probe failed, or a `Complete` restore Job without `COUNTS OK`.
+- **RED** — a condition not `True`, MCK missing/not `Running`, pod not `Ready`, restore Job not `Complete`, or the KubeDB source gone or not halted.
+
+Compare the printed counts against the dump by hand if the restore log is gone and the data matters: `DataSynced` proves the check passed, but only the printed numbers show what landed.
+
 ## Verdicts
 
 - **GREEN** — safe to confirm. The script prints the exact annotate command; run it yourself.
 - **YELLOW** — needs a human. Investigate (restart + re-check, or diff against the source PVC) before confirming.
-- **RED** — broken (a condition not True; for redis: rsync incomplete or pod not Ready; for postgres: CNPG cluster missing/unhealthy; for elasticsearch: OpenSearchCluster missing/not RUNNING, pod not Ready, or an unassigned primary shard). Do not confirm.
+- **RED** — broken (a condition not True; for redis: rsync incomplete or pod not Ready; for postgres: CNPG cluster missing/unhealthy; for elasticsearch: OpenSearchCluster missing/not RUNNING, pod not Ready, or an unassigned primary shard; for mongodb: MCK not Running, restore Job not Complete, or the KubeDB source gone/not halted). Do not confirm.
 
 ## Confirming (you run this, not the skill)
 
